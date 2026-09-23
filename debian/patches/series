@@ -1,2 +1,3 @@
 0001-Fallback-to-XDG_SESSION_ID-if-sd_pid_get_session-fai.patch
 0002-Print-an-error-if-session_id-is-NULL.patch
+0003-Follow-the-user-s-display-session-outside-a-session-.patch
