@@ -1,3 +1,12 @@
+light-locker (1.8.0-3ubuntu4+unity1) resolute; urgency=medium
+
+  * d/p/0003-Follow-the-user-s-display-session-outside-a-session-.patch:
+    fall back to the user's display session when logind cannot map our
+    PID to a session, instead of aborting in init_session_id() (LP:
+    #2038808)
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Wed, 23 Sep 2026 17:26:48 +0000
+
 light-locker (1.8.0-3ubuntu4) resolute; urgency=medium
 
   * Merge with Debian. Remaining change:
