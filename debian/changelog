@@ -1,3 +1,11 @@
+light-locker (1.8.0-3ubuntu4+unity2) resolute; urgency=medium
+
+  * d/p/0004-Find-the-LightDM-session-when-XDG_SESSION_PATH-is-mi.patch:
+    discover the LightDM session over D-Bus when XDG_SESSION_PATH is not
+    inherited, instead of aborting in query_seat_path() (LP: #2038808)
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Wed, 23 Sep 2026 17:36:23 +0000
+
 light-locker (1.8.0-3ubuntu4+unity1) resolute; urgency=medium
 
   * d/p/0003-Follow-the-user-s-display-session-outside-a-session-.patch:
