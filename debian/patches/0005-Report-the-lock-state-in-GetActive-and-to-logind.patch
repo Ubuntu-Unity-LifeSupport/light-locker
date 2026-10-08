@@ -1,0 +1,185 @@
+From: NeiroNext <mihail.rozshko@gmail.com>
+Date: Thu, 8 Oct 2026 12:37:28 +0000
+Subject: Report the lock state in GetActive and to logind
+
+GetActive and GetActiveTime answered the blank state only, and
+ActiveChanged was sent with the blank state on every blank change. While
+the session was locked but the screen visible again, light-locker said it
+was not active, and an unblank under the lock sent ActiveChanged(false).
+light-locker never told logind about its lock either, so the session's
+LockedHint stayed "no".
+
+GetActive now answers blanked || locked, GetActiveTime counts from the
+start of that combined state, and ActiveChanged is sent from one place,
+only when the combined value changes. The lock state is the existing
+priv->active, set for every lock source and cleared only on a logind or
+ConsoleKit Unlock.
+
+With systemd, SetLockedHint follows priv->active on the session path that
+light-locker already resolves, and "no" is written once after the bus
+names are acquired. Without a session path the hint is skipped with a
+warning; GetActive still answers correctly.
+
+SetActive(FALSE) still cannot unlock.
+
+Forwarded: no
+Last-Update: 2026-10-08
+---
+ src/gs-listener-dbus.c | 98 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 89 insertions(+), 9 deletions(-)
+
+diff --git a/src/gs-listener-dbus.c b/src/gs-listener-dbus.c
+index da2cf1f..0787e65 100644
+--- a/src/gs-listener-dbus.c
++++ b/src/gs-listener-dbus.c
+@@ -79,6 +79,8 @@ struct GSListenerPrivate
+         guint           lid_closed : 1;
+         guint           blanked : 1;
+         time_t          blanked_start;
++        guint           reported_active : 1;
++        time_t          reported_active_start;
+         char           *session_id;
+         char           *seat_path;
+ 
+@@ -312,6 +314,78 @@ gs_listener_send_signal_active_changed (GSListener *listener,
+         send_dbus_boolean_signal (listener, "ActiveChanged", active);
+ }
+ 
++/* What GetActive answers and ActiveChanged reports: the screen is blanked
++ * or the session is locked. A locked session whose screen is visible again
++ * is still active, as with gnome-screensaver. */
++static gboolean
++gs_listener_is_active (GSListener *listener)
++{
++        return listener->priv->blanked || listener->priv->active;
++}
++
++static void
++gs_listener_update_active (GSListener *listener)
++{
++        gboolean active = gs_listener_is_active (listener);
++
++        if (listener->priv->reported_active == active)
++                return;
++
++        listener->priv->reported_active = active;
++        listener->priv->reported_active_start = active ? time (NULL) : 0;
++
++        gs_listener_send_signal_active_changed (listener, active);
++}
++
++static void
++gs_listener_set_locked_hint (GSListener *listener,
++                             gboolean    locked)
++{
++#ifdef WITH_SYSTEMD
++        dbus_bool_t  hint = locked;
++        DBusMessage *message;
++
++        if (! listener->priv->have_systemd) {
++                return;
++        }
++
++        gs_debug ("Send locked hint: %d", locked);
++
++        if (listener->priv->system_connection == NULL) {
++                gs_debug ("No connection to the system bus");
++                return;
++        }
++
++        if (listener->priv->session_id == NULL) {
++                g_warning ("No logind session path, not setting the locked hint");
++                return;
++        }
++
++        message = dbus_message_new_method_call (SYSTEMD_LOGIND_SERVICE,
++                                                listener->priv->session_id,
++                                                SYSTEMD_LOGIND_SESSION_INTERFACE,
++                                                "SetLockedHint");
++        if (message == NULL) {
++                gs_debug ("Couldn't allocate the dbus message");
++                return;
++        }
++
++        if (dbus_message_append_args (message,
++                                      DBUS_TYPE_BOOLEAN, &hint,
++                                      DBUS_TYPE_INVALID) == FALSE) {
++                gs_debug ("Couldn't add args to the dbus message");
++                dbus_message_unref (message);
++                return;
++        }
++
++        if (dbus_connection_send (listener->priv->system_connection, message, NULL) == FALSE) {
++                gs_debug ("Couldn't send the dbus message");
++        }
++
++        dbus_message_unref (message);
++#endif
++}
++
+ void
+ gs_listener_set_blanked (GSListener *listener,
+                          gboolean    active)
+@@ -324,7 +398,7 @@ gs_listener_set_blanked (GSListener *listener,
+                 listener->priv->blanked_start = 0;
+         }
+ 
+-        gs_listener_send_signal_active_changed (listener, active);
++        gs_listener_update_active (listener);
+ }
+ 
+ gboolean
+@@ -352,6 +426,9 @@ gs_listener_set_active (GSListener *listener,
+ 
+         listener->priv->active = active;
+ 
++        gs_listener_set_locked_hint (listener, active);
++        gs_listener_update_active (listener);
++
+         return TRUE;
+ }
+ 
+@@ -1016,12 +1093,12 @@ listener_dbus_handle_session_message (GSListener     *listener,
+                 return listener_set_active (listener, connection, message, TRUE);
+         }
+         if (dbus_message_is_method_call (message, GS_INTERFACE, "GetActive")) {
+-                gs_debug ("Received GetActive request: %d", listener->priv->blanked);
+-                return listener_get_bool (listener, connection, message, listener->priv->blanked);
++                gs_debug ("Received GetActive request: %d", gs_listener_is_active (listener));
++                return listener_get_bool (listener, connection, message, gs_listener_is_active (listener));
+         }
+         if (dbus_message_is_method_call (message, GS_INTERFACE, "GetActiveTime")) {
+-                gs_debug ("Received GetActiveTime request: %d", listener->priv->blanked_start);
+-                return listener_get_time (listener, connection, message, listener->priv->blanked_start);
++                gs_debug ("Received GetActiveTime request: %d", listener->priv->reported_active_start);
++                return listener_get_time (listener, connection, message, listener->priv->reported_active_start);
+         }
+         if (dbus_message_is_method_call (message, GS_INTERFACE, "GetSessionIdleTime")) {
+                 gs_debug ("Received GetSessionIdleTime request");
+@@ -1051,12 +1128,12 @@ listener_dbus_handle_session_message (GSListener     *listener,
+                 return send_success_reply (connection, message);
+         }
+         if (dbus_message_is_method_call (message, GS_INTERFACE_GNOME, "GetActive")) {
+-                gs_debug ("Received GetActive request: %d", listener->priv->blanked);
+-                return listener_get_bool (listener, connection, message, listener->priv->blanked);
++                gs_debug ("Received GetActive request: %d", gs_listener_is_active (listener));
++                return listener_get_bool (listener, connection, message, gs_listener_is_active (listener));
+         }
+         if (dbus_message_is_method_call (message, GS_INTERFACE_GNOME, "GetActiveTime")) {
+-                gs_debug ("Received GetActiveTime request: %d", listener->priv->blanked_start);
+-                return listener_get_time (listener, connection, message, listener->priv->blanked_start);
++                gs_debug ("Received GetActiveTime request: %d", listener->priv->reported_active_start);
++                return listener_get_time (listener, connection, message, listener->priv->reported_active_start);
+         }
+         if (dbus_message_is_method_call (message, GS_INTERFACE_GNOME, "SimulateUserActivity")) {
+                 gs_debug ("Received SimulateUserActivity request");
+@@ -2004,6 +2081,9 @@ gs_listener_acquire (GSListener *listener,
+ #endif
+ #endif
+ 
++                        /* Not locked yet: clear a hint left by a previous locker. */
++                        gs_listener_set_locked_hint (listener, FALSE);
++
+                         return (res != -1);
+                 }
+ #endif
