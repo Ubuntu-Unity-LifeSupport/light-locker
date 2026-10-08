@@ -1,3 +1,13 @@
+light-locker (1.8.0-3ubuntu4+unity3) resolute; urgency=medium
+
+  * d/p/0005: GetActive answers true while the session is locked, not only
+    while the screen is blanked; ActiveChanged is sent once per change of
+    that combined value, so an unblank under the lock no longer reports
+    "not active". The lock is reported to logind (SetLockedHint), and the
+    hint is cleared once at start.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Thu, 08 Oct 2026 12:38:02 +0000
+
 light-locker (1.8.0-3ubuntu4+unity2) resolute; urgency=medium
 
   * d/p/0004-Find-the-LightDM-session-when-XDG_SESSION_PATH-is-mi.patch:
