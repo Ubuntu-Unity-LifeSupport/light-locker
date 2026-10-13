@@ -23,8 +23,8 @@ Forwarded: no
 Last-Update: 2026-10-13
 ---
  src/Makefile.am             |  26 ++
- src/test-listener-inhibit.c | 701 ++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 727 insertions(+)
+ src/test-listener-inhibit.c | 694 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 720 insertions(+)
  create mode 100644 src/test-listener-inhibit.c
 
 diff --git a/src/Makefile.am b/src/Makefile.am
@@ -73,10 +73,10 @@ index ccae77d..5f82df4 100644
  	gs-marshal.list			\
 diff --git a/src/test-listener-inhibit.c b/src/test-listener-inhibit.c
 new file mode 100644
-index 0000000..45b7562
+index 0000000..d06ef2f
 --- /dev/null
 +++ b/src/test-listener-inhibit.c
-@@ -0,0 +1,701 @@
+@@ -0,0 +1,694 @@
 +/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
 + *
 + * Tests of light-locker's org.freedesktop.ScreenSaver inhibitors as the
@@ -185,8 +185,6 @@ index 0000000..45b7562
 +        return NULL;
 +}
 +
-+/* the stand-in session manager */
-+
 +typedef struct {
 +        char  *method;
 +        char  *sender;
@@ -202,9 +200,9 @@ index 0000000..45b7562
 +        guint            object_id;
 +        guint            name_id;
 +        gboolean         owned;
-+        gboolean         defer;         /* hold Inhibit replies */
-+        GPtrArray       *calls;         /* SmCall */
-+        GPtrArray       *held;          /* GDBusMethodInvocation */
++        gboolean         defer;
++        GPtrArray       *calls;
++        GPtrArray       *held;
 +        guint            next_cookie;
 +} FakeSm;
 +
@@ -343,7 +341,6 @@ index 0000000..45b7562
 +        return sm;
 +}
 +
-+/* answer the oldest held Inhibit with this cookie */
 +static void
 +fake_sm_reply (FakeSm *sm, guint cookie)
 +{
@@ -411,15 +408,12 @@ index 0000000..45b7562
 +        return wait_until (count_reached, &c);
 +}
 +
-+/* nothing more than count arrives within a short while */
 +static void
 +assert_count_stays (FakeSm *sm, const char *method, guint count)
 +{
 +        spin (300);
 +        g_assert_cmpuint (fake_sm_count (sm, method), ==, count);
 +}
-+
-+/* callers */
 +
 +typedef struct {
 +        gboolean  done;
@@ -477,7 +471,6 @@ index 0000000..45b7562
 +        g_object_unref (connection);
 +}
 +
-+/* light-locker's own inhibit state, from its "inhibit" signal */
 +static gboolean own_inhibit;
 +static guint    own_inhibit_changes;
 +
@@ -575,7 +568,7 @@ index 0000000..45b7562
 +        g_assert_true (wait_count (sm, "Uninhibit", 1));
 +        g_assert_false (own_inhibit);
 +
-+        held = fake_sm_new (TRUE);      /* takes the name over */
++        held = fake_sm_new (TRUE);
 +        caller = new_connection ();
 +        ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
 +        g_assert_true (wait_count (held, "Inhibit", 1));
@@ -655,12 +648,12 @@ index 0000000..45b7562
 +        cookie = ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
 +        g_assert_true (wait_count (old_sm, "Inhibit", 1));
 +
-+        slow_sm = fake_sm_new (TRUE);   /* takes the name over */
++        slow_sm = fake_sm_new (TRUE);
 +        late = ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
 +        g_assert_true (wait_count (slow_sm, "Inhibit", 1));
 +
-+        new_sm = fake_sm_new (FALSE);   /* takes the name from the slow one */
-+        fake_sm_reply (slow_sm, 66);    /* late answer from the old owner */
++        new_sm = fake_sm_new (FALSE);
++        fake_sm_reply (slow_sm, 66);
 +        spin (300);
 +
 +        ss_uninhibit (caller, cookie);

@@ -234,7 +234,7 @@ index 0787e65..d2b9c96 100644
          g_free (listener->priv->sd_session_id);
 diff --git a/src/gs-session-inhibit.c b/src/gs-session-inhibit.c
 new file mode 100644
-index 0000000..44cf8d6
+index 0000000..8f2391d
 --- /dev/null
 +++ b/src/gs-session-inhibit.c
 @@ -0,0 +1,256 @@
@@ -271,12 +271,12 @@ index 0000000..44cf8d6
 +        GDBusConnection *connection;
 +        GCancellable    *cancellable;
 +        guint            sm_watch_id;
-+        GHashTable      *entries;       /* ScreenSaver cookie -> Entry */
++        GHashTable      *entries;
 +};
 +
 +typedef struct {
-+        guint32   sm_cookie;    /* 0: none */
-+        char     *sm_owner;     /* unique name that gave sm_cookie */
++        guint32   sm_cookie;
++        char     *sm_owner;
 +        gboolean  pending;
 +        gboolean  released;
 +} Entry;
