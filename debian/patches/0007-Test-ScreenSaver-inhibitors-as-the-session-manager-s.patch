@@ -23,8 +23,8 @@ Forwarded: no
 Last-Update: 2026-10-13
 ---
  src/Makefile.am             |  26 ++
- src/test-listener-inhibit.c | 700 ++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 726 insertions(+)
+ src/test-listener-inhibit.c | 701 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 727 insertions(+)
  create mode 100644 src/test-listener-inhibit.c
 
 diff --git a/src/Makefile.am b/src/Makefile.am
@@ -73,10 +73,10 @@ index ccae77d..5f82df4 100644
  	gs-marshal.list			\
 diff --git a/src/test-listener-inhibit.c b/src/test-listener-inhibit.c
 new file mode 100644
-index 0000000..29e1d93
+index 0000000..45b7562
 --- /dev/null
 +++ b/src/test-listener-inhibit.c
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,701 @@
 +/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
 + *
 + * Tests of light-locker's org.freedesktop.ScreenSaver inhibitors as the
@@ -596,7 +596,6 @@ index 0000000..29e1d93
 +        guint changes, owner_id;
 +
 +        ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
-+        g_assert_true (wait_count (sm, "Inhibit", 1));
 +        changes = own_inhibit_changes;
 +
 +        owner_id = g_bus_own_name_on_connection (caller, "org.mpris.MediaPlayer2.test",
@@ -605,9 +604,11 @@ index 0000000..29e1d93
 +        g_bus_unown_name (owner_id);
 +        spin (300);
 +
-+        assert_count_stays (sm, "Uninhibit", 0);
++        /* light-locker's own inhibitor first, then the session manager's */
 +        g_assert_true (own_inhibit);
 +        g_assert_cmpuint (own_inhibit_changes, ==, changes);
++        g_assert_true (wait_count (sm, "Inhibit", 1));
++        assert_count_stays (sm, "Uninhibit", 0);
 +        close_connection (caller);
 +}
 +
