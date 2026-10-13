@@ -1,3 +1,13 @@
+light-locker (1.8.0-3ubuntu4+unity5) resolute; urgency=medium
+
+  * d/p/0008: in a Unity session (Unity in XDG_CURRENT_DESKTOP) the timer
+    that locks lock-after-screensaver seconds after the blank is not armed;
+    Unity asks for the blank on idle and decides whether and when to lock
+    from the desktop's screensaver settings. The setting is not changed.
+  * d/p/0009: test of the above in make check.
+
+ -- NeiroNext <mihail.rozshko@gmail.com>  Tue, 13 Oct 2026 21:12:51 +0000
+
 light-locker (1.8.0-3ubuntu4+unity4) resolute; urgency=medium
 
   * d/p/0006: the inhibitors applications take through
