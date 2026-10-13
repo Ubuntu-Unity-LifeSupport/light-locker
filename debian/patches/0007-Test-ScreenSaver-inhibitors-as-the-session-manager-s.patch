@@ -1,0 +1,647 @@
+From: NeiroNext <mihail.rozshko@gmail.com>
+Date: Tue, 13 Oct 2026 12:37:13 +0000
+Subject: Test ScreenSaver inhibitors as the session manager sees them
+
+test-listener-inhibit runs in make check: the real listener on a private
+session bus, a stand-in org.gnome.SessionManager and callers on their own
+connections, one process per case: forwarding with the idle flag on both
+object paths, release on UnInhibit (not on another sender's), before the
+session manager answered and when the caller goes away, a caller changing
+a well-known name keeps its inhibitor, no session manager, empty strings,
+and nothing reaching a new session manager.
+
+Forwarded: no
+Last-Update: 2026-10-13
+---
+ src/Makefile.am             |  22 ++
+ src/test-listener-inhibit.c | 581 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 603 insertions(+)
+ create mode 100644 src/test-listener-inhibit.c
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index ccae77d..1d697b8 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -3,6 +3,9 @@ AUTOMAKE_OPTIONS = 1.7
+ 
+ NULL =
+ 
++# sources the listener needs besides its own
++listener_extra_sources =
++
+ saverdir = $(libexecdir)/light-locker
+ 
+ AM_CPPFLAGS =							\
+@@ -114,6 +117,25 @@ preview_LDADD =		\
+ 	$(SAVER_LIBS)			\
+ 	$(NULL)
+ 
++check_PROGRAMS = test-listener-inhibit
++TESTS = $(check_PROGRAMS)
++
++test_listener_inhibit_SOURCES =	\
++	test-listener-inhibit.c	\
++	gs-listener-dbus.c	\
++	gs-listener-dbus.h	\
++	gs-debug.c		\
++	gs-debug.h		\
++	gs-bus.h		\
++	$(listener_extra_sources)	\
++	$(BUILT_SOURCES)	\
++	$(NULL)
++
++test_listener_inhibit_LDADD =	\
++	$(LIGHT_LOCKER_LIBS)	\
++	$(SYSTEMD_LIBS)		\
++	$(NULL)
++
+ EXTRA_DIST =				\
+ 	debug-screensaver.sh		\
+ 	gs-marshal.list			\
+diff --git a/src/test-listener-inhibit.c b/src/test-listener-inhibit.c
+new file mode 100644
+index 0000000..bedfc15
+--- /dev/null
++++ b/src/test-listener-inhibit.c
+@@ -0,0 +1,581 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
++ *
++ * Tests of light-locker's org.freedesktop.ScreenSaver inhibitors as the
++ * session manager sees them: the real listener on a private session bus,
++ * a stand-in org.gnome.SessionManager that records Inhibit and Uninhibit
++ * and answers when the test says so, and callers on their own connections.
++ * Every case runs in its own process; waits are bounded.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include <string.h>
++#include <gio/gio.h>
++
++#include "gs-listener-dbus.h"
++#include "gs-debug.h"
++
++#define SS_NAME      "org.freedesktop.ScreenSaver"
++#define SS_PATH      "/org/freedesktop/ScreenSaver"
++#define SS_PATH_KDE  "/ScreenSaver"
++#define SM_NAME      "org.gnome.SessionManager"
++#define SM_PATH      "/org/gnome/SessionManager"
++
++#define WAIT_MS 5000
++
++static GTestDBus *bus;
++
++/* the stand-in session manager */
++
++typedef struct {
++        char  *method;
++        char  *sender;
++        char  *app;
++        char  *reason;
++        guint  xid;
++        guint  flags;
++        guint  cookie;
++} SmCall;
++
++typedef struct {
++        GDBusConnection *connection;
++        guint            object_id;
++        guint            name_id;
++        gboolean         owned;
++        gboolean         defer;         /* hold Inhibit replies */
++        GPtrArray       *calls;         /* SmCall */
++        GPtrArray       *held;          /* GDBusMethodInvocation */
++        guint            next_cookie;
++} FakeSm;
++
++static const char sm_xml[] =
++        "<node>"
++        "  <interface name='org.gnome.SessionManager'>"
++        "    <method name='Inhibit'>"
++        "      <arg type='s' direction='in'/><arg type='u' direction='in'/>"
++        "      <arg type='s' direction='in'/><arg type='u' direction='in'/>"
++        "      <arg type='u' direction='out'/>"
++        "    </method>"
++        "    <method name='Uninhibit'><arg type='u' direction='in'/></method>"
++        "  </interface>"
++        "</node>";
++
++static void
++sm_call_free (gpointer data)
++{
++        SmCall *call = data;
++
++        g_free (call->method);
++        g_free (call->sender);
++        g_free (call->app);
++        g_free (call->reason);
++        g_free (call);
++}
++
++static void
++sm_method (GDBusConnection       *connection,
++           const char            *sender,
++           const char            *path,
++           const char            *iface,
++           const char            *method,
++           GVariant              *parameters,
++           GDBusMethodInvocation *invocation,
++           gpointer               data)
++{
++        FakeSm *sm = data;
++        SmCall *call = g_new0 (SmCall, 1);
++
++        call->method = g_strdup (method);
++        call->sender = g_strdup (sender);
++        g_ptr_array_add (sm->calls, call);
++
++        if (g_strcmp0 (method, "Inhibit") == 0) {
++                g_variant_get (parameters, "(susu)", &call->app, &call->xid, &call->reason, &call->flags);
++                if (sm->defer) {
++                        g_ptr_array_add (sm->held, invocation);
++                        return;
++                }
++                call->cookie = sm->next_cookie++;
++                g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", call->cookie));
++        } else {
++                g_variant_get (parameters, "(u)", &call->cookie);
++                g_dbus_method_invocation_return_value (invocation, NULL);
++        }
++}
++
++static const GDBusInterfaceVTable sm_vtable = { sm_method, NULL, NULL };
++
++static void
++sm_name_acquired (GDBusConnection *connection, const char *name, gpointer data)
++{
++        ((FakeSm *) data)->owned = TRUE;
++}
++
++static GDBusConnection *
++new_connection (void)
++{
++        GError *error = NULL;
++        GDBusConnection *connection;
++
++        connection = g_dbus_connection_new_for_address_sync (g_test_dbus_get_bus_address (bus),
++                                                             G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
++                                                             G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
++                                                             NULL, NULL, &error);
++        g_assert_no_error (error);
++        return connection;
++}
++
++static gboolean
++timeout_cb (gpointer data)
++{
++        *(gboolean *) data = TRUE;
++        return G_SOURCE_REMOVE;
++}
++
++static void
++spin (guint ms)
++{
++        gboolean done = FALSE;
++
++        g_timeout_add (ms, timeout_cb, &done);
++        while (!done)
++                g_main_context_iteration (NULL, TRUE);
++}
++
++typedef gboolean (*Condition) (gpointer data);
++
++static gboolean
++wait_until (Condition condition, gpointer data)
++{
++        gint64 end = g_get_monotonic_time () + WAIT_MS * 1000;
++
++        while (!condition (data) && g_get_monotonic_time () < end)
++                spin (10);
++        return condition (data);
++}
++
++static gboolean
++sm_owned (gpointer data)
++{
++        return ((FakeSm *) data)->owned;
++}
++
++static FakeSm *
++fake_sm_new (gboolean defer)
++{
++        FakeSm *sm = g_new0 (FakeSm, 1);
++        GDBusNodeInfo *info = g_dbus_node_info_new_for_xml (sm_xml, NULL);
++
++        sm->connection = new_connection ();
++        sm->defer = defer;
++        sm->calls = g_ptr_array_new_with_free_func (sm_call_free);
++        sm->held = g_ptr_array_new ();
++        sm->next_cookie = 100;
++        sm->object_id = g_dbus_connection_register_object (sm->connection, SM_PATH,
++                                                           info->interfaces[0], &sm_vtable,
++                                                           sm, NULL, NULL);
++        sm->name_id = g_bus_own_name_on_connection (sm->connection, SM_NAME,
++                                                    G_BUS_NAME_OWNER_FLAGS_ALLOW_REPLACEMENT |
++                                                    G_BUS_NAME_OWNER_FLAGS_REPLACE,
++                                                    sm_name_acquired, NULL, sm, NULL);
++        g_dbus_node_info_unref (info);
++        g_assert_true (wait_until (sm_owned, sm));
++        return sm;
++}
++
++/* answer the oldest held Inhibit with this cookie */
++static void
++fake_sm_reply (FakeSm *sm, guint cookie)
++{
++        GDBusMethodInvocation *invocation;
++        guint i;
++
++        g_assert_cmpuint (sm->held->len, >, 0);
++        invocation = g_ptr_array_index (sm->held, 0);
++        g_ptr_array_remove_index (sm->held, 0);
++        for (i = 0; i < sm->calls->len; i++) {
++                SmCall *call = g_ptr_array_index (sm->calls, i);
++
++                if (g_strcmp0 (call->method, "Inhibit") == 0 && call->cookie == 0) {
++                        call->cookie = cookie;
++                        break;
++                }
++        }
++        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", cookie));
++}
++
++static guint
++fake_sm_count (FakeSm *sm, const char *method)
++{
++        guint i, n = 0;
++
++        for (i = 0; i < sm->calls->len; i++)
++                if (g_strcmp0 (((SmCall *) g_ptr_array_index (sm->calls, i))->method, method) == 0)
++                        n++;
++        return n;
++}
++
++static SmCall *
++fake_sm_call (FakeSm *sm, const char *method, guint nth)
++{
++        guint i;
++
++        for (i = 0; i < sm->calls->len; i++) {
++                SmCall *call = g_ptr_array_index (sm->calls, i);
++
++                if (g_strcmp0 (call->method, method) == 0 && nth-- == 0)
++                        return call;
++        }
++        return NULL;
++}
++
++typedef struct {
++        FakeSm     *sm;
++        const char *method;
++        guint       count;
++} CountCondition;
++
++static gboolean
++count_reached (gpointer data)
++{
++        CountCondition *c = data;
++
++        return fake_sm_count (c->sm, c->method) >= c->count;
++}
++
++static gboolean
++wait_count (FakeSm *sm, const char *method, guint count)
++{
++        CountCondition c = { sm, method, count };
++
++        return wait_until (count_reached, &c);
++}
++
++/* nothing more than count arrives within a short while */
++static void
++assert_count_stays (FakeSm *sm, const char *method, guint count)
++{
++        spin (300);
++        g_assert_cmpuint (fake_sm_count (sm, method), ==, count);
++}
++
++/* callers */
++
++typedef struct {
++        gboolean  done;
++        GVariant *reply;
++} Call;
++
++static void
++call_done (GObject *source, GAsyncResult *res, gpointer data)
++{
++        Call *call = data;
++
++        call->reply = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), res, NULL);
++        call->done = TRUE;
++}
++
++static gboolean
++call_finished (gpointer data)
++{
++        return ((Call *) data)->done;
++}
++
++static guint
++ss_inhibit (GDBusConnection *caller, const char *path, const char *app, const char *reason)
++{
++        Call call = { FALSE, NULL };
++        guint cookie = 0;
++
++        g_dbus_connection_call (caller, SS_NAME, path, SS_NAME, "Inhibit",
++                                g_variant_new ("(ss)", app, reason), G_VARIANT_TYPE ("(u)"),
++                                G_DBUS_CALL_FLAGS_NO_AUTO_START, WAIT_MS, NULL, call_done, &call);
++        g_assert_true (wait_until (call_finished, &call));
++        g_assert_nonnull (call.reply);
++        g_variant_get (call.reply, "(u)", &cookie);
++        g_variant_unref (call.reply);
++        g_assert_cmpuint (cookie, >, 0);
++        return cookie;
++}
++
++static void
++ss_uninhibit (GDBusConnection *caller, guint cookie)
++{
++        Call call = { FALSE, NULL };
++
++        g_dbus_connection_call (caller, SS_NAME, SS_PATH, SS_NAME, "UnInhibit",
++                                g_variant_new ("(u)", cookie), NULL,
++                                G_DBUS_CALL_FLAGS_NO_AUTO_START, WAIT_MS, NULL, call_done, &call);
++        g_assert_true (wait_until (call_finished, &call));
++        g_clear_pointer (&call.reply, g_variant_unref);
++}
++
++static void
++close_connection (GDBusConnection *connection)
++{
++        g_dbus_connection_close_sync (connection, NULL, NULL);
++        g_object_unref (connection);
++}
++
++/* light-locker's own inhibit state, from its "inhibit" signal */
++static gboolean own_inhibit;
++static guint    own_inhibit_changes;
++
++static void
++on_inhibit (GSListener *listener, gboolean inhibit, gpointer data)
++{
++        own_inhibit = inhibit;
++        own_inhibit_changes++;
++}
++
++/* (a) both object paths forward to the session manager with the idle flag */
++static void
++test_forward (void)
++{
++        FakeSm *sm = fake_sm_new (FALSE);
++        GDBusConnection *caller = new_connection ();
++        SmCall *call;
++
++        ss_inhibit (caller, SS_PATH_KDE, "vlc", "Playing media");
++        ss_inhibit (caller, SS_PATH, "firefox", "Playing audio");
++        g_assert_true (wait_count (sm, "Inhibit", 2));
++
++        call = fake_sm_call (sm, "Inhibit", 0);
++        g_assert_cmpstr (call->app, ==, "vlc");
++        g_assert_cmpstr (call->reason, ==, "Playing media");
++        g_assert_cmpuint (call->xid, ==, 0);
++        g_assert_cmpuint (call->flags, ==, 8);
++        call = fake_sm_call (sm, "Inhibit", 1);
++        g_assert_cmpstr (call->app, ==, "firefox");
++        g_assert_cmpstr (call->reason, ==, "Playing audio");
++        g_assert_cmpuint (call->flags, ==, 8);
++        g_assert_true (own_inhibit);
++        close_connection (caller);
++}
++
++/* (b) UnInhibit releases the session manager's inhibitor; another sender's
++ * UnInhibit of the same cookie does nothing */
++static void
++test_uninhibit (void)
++{
++        FakeSm *sm = fake_sm_new (FALSE);
++        GDBusConnection *caller = new_connection ();
++        GDBusConnection *other = new_connection ();
++        guint cookie;
++
++        cookie = ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (wait_count (sm, "Inhibit", 1));
++
++        ss_uninhibit (other, cookie);
++        assert_count_stays (sm, "Uninhibit", 0);
++        g_assert_true (own_inhibit);
++
++        ss_uninhibit (caller, cookie);
++        g_assert_true (wait_count (sm, "Uninhibit", 1));
++        g_assert_cmpuint (fake_sm_call (sm, "Uninhibit", 0)->cookie, ==,
++                          fake_sm_call (sm, "Inhibit", 0)->cookie);
++        g_assert_false (own_inhibit);
++        close_connection (other);
++        close_connection (caller);
++}
++
++/* (c) released before the session manager answered: light-locker's own
++ * inhibit ends at once, the session manager's after its answer */
++static void
++test_release_before_reply (void)
++{
++        FakeSm *sm = fake_sm_new (TRUE);
++        GDBusConnection *caller = new_connection ();
++        guint cookie;
++
++        cookie = ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (wait_count (sm, "Inhibit", 1));
++        ss_uninhibit (caller, cookie);
++        g_assert_false (own_inhibit);
++        assert_count_stays (sm, "Uninhibit", 0);
++
++        fake_sm_reply (sm, 77);
++        g_assert_true (wait_count (sm, "Uninhibit", 1));
++        g_assert_cmpuint (fake_sm_call (sm, "Uninhibit", 0)->cookie, ==, 77);
++        close_connection (caller);
++}
++
++/* (d) a caller that goes away releases its inhibitors, also before the
++ * session manager answered */
++static void
++test_caller_vanishes (void)
++{
++        FakeSm *sm = fake_sm_new (FALSE);
++        FakeSm *held;
++        GDBusConnection *caller = new_connection ();
++
++        ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (wait_count (sm, "Inhibit", 1));
++        close_connection (caller);
++        g_assert_true (wait_count (sm, "Uninhibit", 1));
++        g_assert_false (own_inhibit);
++
++        held = fake_sm_new (TRUE);      /* takes the name over */
++        caller = new_connection ();
++        ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (wait_count (held, "Inhibit", 1));
++        close_connection (caller);
++        spin (300);
++        fake_sm_reply (held, 55);
++        g_assert_true (wait_count (held, "Uninhibit", 1));
++        g_assert_cmpuint (fake_sm_call (held, "Uninhibit", 0)->cookie, ==, 55);
++}
++
++/* (e) a live caller that takes and drops a well-known name keeps its
++ * inhibitor */
++static void
++test_well_known_name_change (void)
++{
++        FakeSm *sm = fake_sm_new (FALSE);
++        GDBusConnection *caller = new_connection ();
++        guint changes, owner_id;
++
++        ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (wait_count (sm, "Inhibit", 1));
++        changes = own_inhibit_changes;
++
++        owner_id = g_bus_own_name_on_connection (caller, "org.mpris.MediaPlayer2.test",
++                                                 G_BUS_NAME_OWNER_FLAGS_NONE, NULL, NULL, NULL, NULL);
++        spin (300);
++        g_bus_unown_name (owner_id);
++        spin (300);
++
++        assert_count_stays (sm, "Uninhibit", 0);
++        g_assert_true (own_inhibit);
++        g_assert_cmpuint (own_inhibit_changes, ==, changes);
++        close_connection (caller);
++}
++
++/* (f) without a session manager light-locker's own inhibitor still works */
++static void
++test_no_session_manager (void)
++{
++        GDBusConnection *caller = new_connection ();
++        guint cookie;
++
++        cookie = ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (own_inhibit);
++        ss_uninhibit (caller, cookie);
++        g_assert_false (own_inhibit);
++        close_connection (caller);
++}
++
++/* (g) the session manager refuses empty strings: substitutes are sent */
++static void
++test_empty_strings (void)
++{
++        FakeSm *sm = fake_sm_new (FALSE);
++        GDBusConnection *caller = new_connection ();
++        SmCall *call;
++
++        ss_inhibit (caller, SS_PATH, "", "");
++        g_assert_true (wait_count (sm, "Inhibit", 1));
++        call = fake_sm_call (sm, "Inhibit", 0);
++        g_assert_cmpstr (call->app, ==, g_dbus_connection_get_unique_name (caller));
++        g_assert_cmpstr (call->reason, !=, "");
++        close_connection (caller);
++}
++
++/* (h) after the session manager changed, nothing reaches the new one: not
++ * for an inhibitor it did not give, not for an answer the old one gave late */
++static void
++test_session_manager_changes (void)
++{
++        FakeSm *old_sm = fake_sm_new (FALSE);
++        FakeSm *slow_sm, *new_sm;
++        GDBusConnection *caller = new_connection ();
++        guint cookie, late;
++
++        cookie = ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (wait_count (old_sm, "Inhibit", 1));
++
++        slow_sm = fake_sm_new (TRUE);   /* takes the name over */
++        late = ss_inhibit (caller, SS_PATH, "vlc", "Playing media");
++        g_assert_true (wait_count (slow_sm, "Inhibit", 1));
++
++        new_sm = fake_sm_new (FALSE);   /* takes the name from the slow one */
++        fake_sm_reply (slow_sm, 66);    /* late answer from the old owner */
++        spin (300);
++
++        ss_uninhibit (caller, cookie);
++        ss_uninhibit (caller, late);
++        assert_count_stays (new_sm, "Uninhibit", 0);
++        g_assert_false (own_inhibit);
++        close_connection (caller);
++}
++
++typedef struct {
++        const char *path;
++        void      (*func) (void);
++} Case;
++
++static const Case cases[] = {
++        { "/listener-inhibit/forward", test_forward },
++        { "/listener-inhibit/uninhibit", test_uninhibit },
++        { "/listener-inhibit/release-before-reply", test_release_before_reply },
++        { "/listener-inhibit/caller-vanishes", test_caller_vanishes },
++        { "/listener-inhibit/well-known-name-change", test_well_known_name_change },
++        { "/listener-inhibit/no-session-manager", test_no_session_manager },
++        { "/listener-inhibit/empty-strings", test_empty_strings },
++        { "/listener-inhibit/session-manager-changes", test_session_manager_changes },
++};
++
++static void
++run_case (gconstpointer data)
++{
++        const Case *c = data;
++
++        if (g_test_subprocess ()) {
++                GSListener *listener;
++                GError *error = NULL;
++
++                bus = g_test_dbus_new (G_TEST_DBUS_NONE);
++                g_test_dbus_up (bus);
++
++                listener = gs_listener_new ();
++                g_signal_connect (listener, "inhibit", G_CALLBACK (on_inhibit), NULL);
++                g_assert_true (gs_listener_acquire (listener, &error));
++                g_assert_no_error (error);
++
++                c->func ();
++                g_test_dbus_stop (bus);
++                return;
++        }
++
++        g_test_trap_subprocess (NULL, 60 * G_USEC_PER_SEC,
++                                G_TEST_SUBPROCESS_INHERIT_STDOUT | G_TEST_SUBPROCESS_INHERIT_STDERR);
++        if (!g_test_trap_has_passed ())
++                g_test_fail ();
++}
++
++int
++main (int argc, char **argv)
++{
++        char **args;
++        int n_args;
++        guint i;
++
++        /* report every case, not only up to the first failing one */
++        args = g_new0 (char *, argc + 2);
++        for (n_args = 0; n_args < argc; n_args++)
++                args[n_args] = argv[n_args];
++        args[n_args++] = (char *) "--keep-going";
++        g_test_init (&n_args, &args, NULL);
++
++        gs_debug_init (TRUE, FALSE);
++
++        for (i = 0; i < G_N_ELEMENTS (cases); i++)
++                g_test_add_data_func (cases[i].path, &cases[i], run_case);
++
++        return g_test_run ();
++}

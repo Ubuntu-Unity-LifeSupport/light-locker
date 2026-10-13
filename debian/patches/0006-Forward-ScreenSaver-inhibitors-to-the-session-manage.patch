@@ -1,0 +1,537 @@
+From: NeiroNext <mihail.rozshko@gmail.com>
+Date: Tue, 13 Oct 2026 12:35:32 +0000
+Subject: Forward ScreenSaver inhibitors to the session manager
+
+light-locker owns org.freedesktop.ScreenSaver and kept the inhibitors
+applications take there (VLC, Firefox while playing) to itself: they
+stopped only its own activation. The session manager never heard of them,
+so with the session's idle presence working, the session went idle,
+blanked and locked during playback.
+
+Each inhibitor is now also taken from org.gnome.SessionManager as an idle
+inhibitor (flag 8, toplevel 0, the caller's application and reason, a
+non-empty substitute when either is empty), asynchronously; the caller's
+cookie and reply do not wait for it. It is released on UnInhibit and when
+the caller's unique name goes away, also when that happens before the
+session manager answered. Uninhibit goes to the unique name that gave the
+cookie. When the session manager goes away its inhibitors are forgotten,
+not taken again. Inhibitors held for light-locker go with its connection.
+Cookies skip 0 and cookies in use.
+
+A caller now counts as gone only when its own unique name goes away: a
+live caller that takes or drops a well-known name keeps its inhibitors
+(it used to lose them, light-locker's own included).
+
+Nothing new is allowed: any client on the session bus can take a session
+manager inhibitor itself. The application and reason become visible in the
+session manager's inhibitor list on the same user's bus, as for any other
+inhibitor. One session manager inhibitor per ScreenSaver inhibitor, gone
+with its caller.
+
+Forwarded: no
+Last-Update: 2026-10-13
+---
+ src/Makefile.am          |   6 ++
+ src/gs-listener-dbus.c   |  62 +++++++++---
+ src/gs-session-inhibit.c | 256 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/gs-session-inhibit.h |  35 +++++++
+ 4 files changed, 345 insertions(+), 14 deletions(-)
+ create mode 100644 src/gs-session-inhibit.c
+ create mode 100644 src/gs-session-inhibit.h
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 0fa4ef9..ccae77d 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -62,6 +62,11 @@ gs-marshal.c: gs-marshal.list
+ gs-marshal.h: gs-marshal.list
+ 	@GLIB_GENMARSHAL@ $< --prefix=gs_marshal --header > $@
+ 
++listener_extra_sources +=	\
++	gs-session-inhibit.c	\
++	gs-session-inhibit.h	\
++	$(NULL)
++
+ light_locker_SOURCES =	\
+ 	light-locker.c		\
+ 	light-locker.h		\
+@@ -84,6 +89,7 @@ light_locker_SOURCES =	\
+ 	gs-grab.h		\
+ 	gs-content.c		\
+ 	gs-content.h		\
++	$(listener_extra_sources)	\
+ 	$(BUILT_SOURCES)	\
+ 	$(NULL)
+ 
+diff --git a/src/gs-listener-dbus.c b/src/gs-listener-dbus.c
+index 0787e65..d2b9c96 100644
+--- a/src/gs-listener-dbus.c
++++ b/src/gs-listener-dbus.c
+@@ -51,6 +51,7 @@
+ #include "gs-marshal.h"
+ #include "gs-debug.h"
+ #include "gs-bus.h"
++#include "gs-session-inhibit.h"
+ 
+ /* this is for dbus < 0.3 */
+ #if ((DBUS_VERSION_MAJOR == 0) && (DBUS_VERSION_MINOR < 30))
+@@ -92,6 +93,7 @@ struct GSListenerPrivate
+ 
+         dbus_uint32_t   inhibit_last_cookie;
+         GHashTable     *inhibit_list;
++        GSSessionInhibit *session_inhibit;
+ };
+ 
+ enum {
+@@ -598,7 +600,9 @@ gs_listener_resume_suspend (GSListener *listener)
+ 
+ static dbus_uint32_t
+ gs_listener_add_inhibit (GSListener *listener,
+-                         const char *owner)
++                         const char *owner,
++                         const char *application,
++                         const char *reason)
+ {
+         dbus_uint32_t *cookie;
+ 
+@@ -607,7 +611,11 @@ gs_listener_add_inhibit (GSListener *listener,
+                 g_error ("No memory");
+         }
+ 
+-        *cookie = ++listener->priv->inhibit_last_cookie;
++        do {
++                *cookie = ++listener->priv->inhibit_last_cookie;
++        } while (*cookie == 0 ||
++                 g_hash_table_contains (listener->priv->inhibit_list, cookie) ||
++                 gs_session_inhibit_has (listener->priv->session_inhibit, *cookie));
+ 
+         if (g_hash_table_size (listener->priv->inhibit_list) == 0) {
+                 g_signal_emit (listener, signals [INHIBIT], 0, TRUE);
+@@ -615,6 +623,8 @@ gs_listener_add_inhibit (GSListener *listener,
+ 
+         g_hash_table_insert (listener->priv->inhibit_list, cookie, g_strdup (owner));
+ 
++        gs_session_inhibit_add (listener->priv->session_inhibit, *cookie, application, reason, owner);
++
+         return *cookie;
+ }
+ 
+@@ -636,21 +646,31 @@ gs_listener_remove_inhibit (GSListener    *listener,
+         }
+ 
+         g_hash_table_remove (listener->priv->inhibit_list, &cookie);
++        gs_session_inhibit_remove (listener->priv->session_inhibit, cookie);
+ 
+         if (g_hash_table_size (listener->priv->inhibit_list) == 0) {
+                 g_signal_emit (listener, signals [INHIBIT], 0, FALSE);
+         }
+ }
+ 
++typedef struct {
++        GSListener *listener;
++        const char *owner;
++} OwnerMatch;
++
+ static gboolean
+ compare_owner (gpointer key,
+                gpointer value,
+                gpointer user_data)
+ {
+         const gchar *oa = value;
+-        const char *ob = user_data;
++        OwnerMatch *match = user_data;
++
++        if (strcmp (oa, match->owner) != 0)
++                return FALSE;
+ 
+-        return strcmp (oa, ob) == 0;;
++        gs_session_inhibit_remove (match->listener->priv->session_inhibit, *(dbus_uint32_t *) key);
++        return TRUE;
+ }
+ 
+ static void
+@@ -659,7 +679,9 @@ gs_listener_disonnect_inhibit (GSListener  *listener,
+ {
+         guint count;
+ 
+-        count = g_hash_table_foreach_remove (listener->priv->inhibit_list, compare_owner, (gpointer)owner);
++        OwnerMatch match = { listener, owner };
++
++        count = g_hash_table_foreach_remove (listener->priv->inhibit_list, compare_owner, &match);
+ 
+         gs_debug ("Inhibitor disconnected: %s (%u)", owner, count);
+ 
+@@ -917,7 +939,7 @@ listener_inhibit (GSListener     *listener,
+ 
+         gs_debug ("Inhibit requested: %s '%s'", application, reason);
+ 
+-        cookie = gs_listener_add_inhibit (listener, dbus_message_get_sender (message));
++        cookie = gs_listener_add_inhibit (listener, dbus_message_get_sender (message), application, reason);
+ 
+         reply = dbus_message_new_method_return (message);
+ 
+@@ -1152,20 +1174,23 @@ listener_dbus_handle_owner_changed (GSListener     *listener,
+                                     DBusConnection *connection,
+                                     DBusMessage    *message)
+ {
+-        DBusMessageIter  iter;
+-        int              type;
++        const char      *name;
+         const char      *old_owner;
++        const char      *new_owner;
+ 
+-        dbus_message_iter_init (message, &iter);
+-        dbus_message_iter_next (&iter);
+-        type = dbus_message_iter_get_arg_type (&iter);
+-
+-        if (type != DBUS_TYPE_STRING) {
++        if (!dbus_message_get_args (message, NULL,
++                                    DBUS_TYPE_STRING, &name,
++                                    DBUS_TYPE_STRING, &old_owner,
++                                    DBUS_TYPE_STRING, &new_owner,
++                                    DBUS_TYPE_INVALID)) {
+                 gs_debug ("Invalid NameOwnerChanged message");
+                 return;
+         }
+ 
+-        dbus_message_iter_get_basic (&iter, &old_owner);
++        /* only a caller's unique name going away; a live caller that takes
++         * or drops a well-known name keeps its inhibitors */
++        if (name[0] != ':' || strcmp (name, old_owner) != 0 || new_owner[0] != '\0')
++                return;
+ 
+         gs_listener_disonnect_inhibit (listener, old_owner);
+ }
+@@ -2572,6 +2597,8 @@ init_seat_path (GSListener *listener)
+ static void
+ gs_listener_init (GSListener *listener)
+ {
++        GDBusConnection *session_bus;
++
+         listener->priv = GS_LISTENER_GET_PRIVATE (listener);
+ 
+ #ifdef WITH_SYSTEMD
+@@ -2586,6 +2613,12 @@ gs_listener_init (GSListener *listener)
+         init_seat_path (listener);
+ 
+         listener->priv->inhibit_list = g_hash_table_new_full (g_int_hash, g_int_equal, g_free, g_free);
++
++        session_bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, NULL);
++        if (session_bus != NULL) {
++                listener->priv->session_inhibit = gs_session_inhibit_new (session_bus);
++                g_object_unref (session_bus);
++        }
+ }
+ 
+ static void
+@@ -2602,6 +2635,7 @@ gs_listener_finalize (GObject *object)
+ 
+         g_free (listener->priv->session_id);
+         g_free (listener->priv->seat_path);
++        gs_session_inhibit_free (listener->priv->session_inhibit);
+ 
+ #ifdef WITH_SYSTEMD
+         g_free (listener->priv->sd_session_id);
+diff --git a/src/gs-session-inhibit.c b/src/gs-session-inhibit.c
+new file mode 100644
+index 0000000..44cf8d6
+--- /dev/null
++++ b/src/gs-session-inhibit.c
+@@ -0,0 +1,256 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
++ *
++ * Forward org.freedesktop.ScreenSaver inhibitors to the session manager
++ *
++ * Each inhibitor an application takes through org.freedesktop.ScreenSaver
++ * is passed on as an idle inhibitor of org.gnome.SessionManager (as
++ * gnome-screensaver 2.x did), so that the session does not go idle while
++ * the application holds it, and released with it.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include <string.h>
++
++#include "gs-session-inhibit.h"
++#include "gs-debug.h"
++
++#define SM_NAME      "org.gnome.SessionManager"
++#define SM_PATH      "/org/gnome/SessionManager"
++#define SM_INTERFACE "org.gnome.SessionManager"
++#define SM_FLAG_IDLE 8
++
++#define DEFAULT_REASON "Inhibited through org.freedesktop.ScreenSaver"
++
++struct GSSessionInhibit {
++        GDBusConnection *connection;
++        GCancellable    *cancellable;
++        guint            sm_watch_id;
++        GHashTable      *entries;       /* ScreenSaver cookie -> Entry */
++};
++
++typedef struct {
++        guint32   sm_cookie;    /* 0: none */
++        char     *sm_owner;     /* unique name that gave sm_cookie */
++        gboolean  pending;
++        gboolean  released;
++} Entry;
++
++typedef struct {
++        GSSessionInhibit *inhibit;
++        guint32           cookie;
++} Call;
++
++static void
++entry_free (gpointer data)
++{
++        Entry *entry = data;
++
++        g_free (entry->sm_owner);
++        g_free (entry);
++}
++
++static void
++send_uninhibit (GSSessionInhibit *inhibit,
++                Entry            *entry)
++{
++        if (entry->sm_cookie == 0 || entry->sm_owner == NULL)
++                return;
++
++        /* to the session manager that gave the cookie, by its unique name:
++         * session manager cookies are not tied to the caller, so a stale
++         * one must not reach a new owner of the well-known name */
++        g_dbus_connection_call (inhibit->connection,
++                                entry->sm_owner,
++                                SM_PATH,
++                                SM_INTERFACE,
++                                "Uninhibit",
++                                g_variant_new ("(u)", entry->sm_cookie),
++                                NULL,
++                                G_DBUS_CALL_FLAGS_NO_AUTO_START,
++                                -1,
++                                NULL, NULL, NULL);
++}
++
++static void
++inhibit_reply (GObject      *source,
++               GAsyncResult *result,
++               gpointer      user_data)
++{
++        Call             *call = user_data;
++        GSSessionInhibit *inhibit = call->inhibit;
++        GDBusMessage     *reply;
++        GError           *error = NULL;
++        Entry            *entry;
++
++        reply = g_dbus_connection_send_message_with_reply_finish (G_DBUS_CONNECTION (source),
++                                                                  result, &error);
++        if (reply == NULL && g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
++                g_error_free (error);
++                g_free (call);
++                return;
++        }
++
++        entry = g_hash_table_lookup (inhibit->entries, &call->cookie);
++        g_assert (entry != NULL && entry->pending);
++        entry->pending = FALSE;
++
++        if (reply != NULL && !g_dbus_message_to_gerror (reply, &error)) {
++                g_variant_get (g_dbus_message_get_body (reply), "(u)", &entry->sm_cookie);
++                entry->sm_owner = g_strdup (g_dbus_message_get_sender (reply));
++                gs_debug ("Session manager inhibitor %u for ScreenSaver cookie %u",
++                          entry->sm_cookie, call->cookie);
++        } else {
++                gs_debug ("Session manager Inhibit failed: %s", error->message);
++                g_clear_error (&error);
++                entry->released = TRUE;
++        }
++
++        if (entry->released) {
++                send_uninhibit (inhibit, entry);
++                g_hash_table_remove (inhibit->entries, &call->cookie);
++        }
++
++        g_clear_object (&reply);
++        g_free (call);
++}
++
++/* The session manager went away or changed owner: its inhibitors went with
++ * it, and a new one is not asked again (a new session manager is a new
++ * session). */
++static void
++sm_vanished (GDBusConnection *connection,
++             const char      *name,
++             gpointer         user_data)
++{
++        GSSessionInhibit *inhibit = user_data;
++        GHashTableIter    iter;
++        Entry            *entry;
++
++        g_hash_table_iter_init (&iter, inhibit->entries);
++        while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &entry)) {
++                if (entry->pending)
++                        continue;
++                entry->sm_cookie = 0;
++                g_clear_pointer (&entry->sm_owner, g_free);
++        }
++}
++
++GSSessionInhibit *
++gs_session_inhibit_new (GDBusConnection *connection)
++{
++        GSSessionInhibit *inhibit;
++
++        g_return_val_if_fail (G_IS_DBUS_CONNECTION (connection), NULL);
++
++        inhibit = g_new0 (GSSessionInhibit, 1);
++        inhibit->connection = g_object_ref (connection);
++        inhibit->cancellable = g_cancellable_new ();
++        inhibit->entries = g_hash_table_new_full (g_int_hash, g_int_equal, g_free, entry_free);
++        inhibit->sm_watch_id = g_bus_watch_name_on_connection (connection,
++                                                               SM_NAME,
++                                                               G_BUS_NAME_WATCHER_FLAGS_NONE,
++                                                               NULL,
++                                                               sm_vanished,
++                                                               inhibit,
++                                                               NULL);
++        return inhibit;
++}
++
++void
++gs_session_inhibit_free (GSSessionInhibit *inhibit)
++{
++        if (inhibit == NULL)
++                return;
++
++        g_cancellable_cancel (inhibit->cancellable);
++        g_bus_unwatch_name (inhibit->sm_watch_id);
++        g_hash_table_destroy (inhibit->entries);
++        g_object_unref (inhibit->cancellable);
++        g_object_unref (inhibit->connection);
++        g_free (inhibit);
++}
++
++gboolean
++gs_session_inhibit_has (GSSessionInhibit *inhibit,
++                        guint32           cookie)
++{
++        return inhibit != NULL && g_hash_table_contains (inhibit->entries, &cookie);
++}
++
++void
++gs_session_inhibit_add (GSSessionInhibit *inhibit,
++                        guint32           cookie,
++                        const char       *application,
++                        const char       *reason,
++                        const char       *caller)
++{
++        GDBusMessage *message;
++        guint32      *key;
++        Entry        *entry;
++        Call         *call;
++
++        if (inhibit == NULL)
++                return;
++
++        g_return_if_fail (!g_hash_table_contains (inhibit->entries, &cookie));
++
++        /* the session manager refuses empty strings */
++        if (application == NULL || *application == '\0')
++                application = caller;
++        if (reason == NULL || *reason == '\0')
++                reason = DEFAULT_REASON;
++
++        message = g_dbus_message_new_method_call (SM_NAME, SM_PATH, SM_INTERFACE, "Inhibit");
++        g_dbus_message_set_body (message, g_variant_new ("(susu)", application, 0, reason,
++                                                         SM_FLAG_IDLE));
++        g_dbus_message_set_flags (message, G_DBUS_MESSAGE_FLAGS_NO_AUTO_START);
++
++        key = g_new (guint32, 1);
++        *key = cookie;
++        entry = g_new0 (Entry, 1);
++        entry->pending = TRUE;
++        g_hash_table_insert (inhibit->entries, key, entry);
++
++        call = g_new (Call, 1);
++        call->inhibit = inhibit;
++        call->cookie = cookie;
++        g_dbus_connection_send_message_with_reply (inhibit->connection,
++                                                   message,
++                                                   G_DBUS_SEND_MESSAGE_FLAGS_NONE,
++                                                   -1,
++                                                   NULL,
++                                                   inhibit->cancellable,
++                                                   inhibit_reply,
++                                                   call);
++        g_object_unref (message);
++}
++
++void
++gs_session_inhibit_remove (GSSessionInhibit *inhibit,
++                           guint32           cookie)
++{
++        Entry *entry;
++
++        if (inhibit == NULL)
++                return;
++
++        entry = g_hash_table_lookup (inhibit->entries, &cookie);
++        if (entry == NULL)
++                return;
++
++        /* released before the session manager answered: Uninhibit when the
++         * answer comes */
++        if (entry->pending) {
++                entry->released = TRUE;
++                return;
++        }
++
++        send_uninhibit (inhibit, entry);
++        g_hash_table_remove (inhibit->entries, &cookie);
++}
+diff --git a/src/gs-session-inhibit.h b/src/gs-session-inhibit.h
+new file mode 100644
+index 0000000..bf2c8e4
+--- /dev/null
++++ b/src/gs-session-inhibit.h
+@@ -0,0 +1,35 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
++ *
++ * Forward org.freedesktop.ScreenSaver inhibitors to the session manager
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef __GS_SESSION_INHIBIT_H
++#define __GS_SESSION_INHIBIT_H
++
++#include <gio/gio.h>
++
++G_BEGIN_DECLS
++
++typedef struct GSSessionInhibit GSSessionInhibit;
++
++GSSessionInhibit *gs_session_inhibit_new    (GDBusConnection  *connection);
++void              gs_session_inhibit_free   (GSSessionInhibit *inhibit);
++
++gboolean          gs_session_inhibit_has    (GSSessionInhibit *inhibit,
++                                             guint32           cookie);
++void              gs_session_inhibit_add    (GSSessionInhibit *inhibit,
++                                             guint32           cookie,
++                                             const char       *application,
++                                             const char       *reason,
++                                             const char       *caller);
++void              gs_session_inhibit_remove (GSSessionInhibit *inhibit,
++                                             guint32           cookie);
++
++G_END_DECLS
++
++#endif /* __GS_SESSION_INHIBIT_H */

@@ -1,3 +1,15 @@
+light-locker (1.8.0-3ubuntu4+unity4) resolute; urgency=medium
+
+  * d/p/0006: the inhibitors applications take through
+    org.freedesktop.ScreenSaver (video players, browsers) are also taken
+    from the session manager as idle inhibitors and released with them, so
+    the session does not go idle, blank and lock while they are held. A
+    caller now counts as gone only when its own bus name goes away.
+  * d/p/0007: test of the above in make check (private session bus);
+    Build-Depends: dbus-daemon <!nocheck>.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Tue, 13 Oct 2026 12:37:42 +0000
+
 light-locker (1.8.0-3ubuntu4+unity3) resolute; urgency=medium
 
   * d/p/0005: GetActive answers true while the session is locked, not only
