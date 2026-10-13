@@ -10,16 +10,25 @@ session manager answered and when the caller goes away, a caller changing
 a well-known name keeps its inhibitor, no session manager, empty strings,
 and nothing reaching a new session manager.
 
+The listener needs its logind session at start. The harness puts it on
+the logind path it takes on the target, without touching the files under
+test: DBUS_SESSION_BUS_ADDRESS and DBUS_SYSTEM_BUS_ADDRESS point at two
+private buses; a stand-in org.freedesktop.login1 answering only
+GetSessionByPID is served from its own thread on the system bus;
+XDG_SESSION_PATH is a dummy path, XDG_SESSION_ID is unset; the test is
+linked with --wrap=access so that the listener sees /run/systemd/seats/.
+The harness checks its own setup before each case.
+
 Forwarded: no
 Last-Update: 2026-10-13
 ---
- src/Makefile.am             |  22 ++
- src/test-listener-inhibit.c | 581 ++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 603 insertions(+)
+ src/Makefile.am             |  26 ++
+ src/test-listener-inhibit.c | 700 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 726 insertions(+)
  create mode 100644 src/test-listener-inhibit.c
 
 diff --git a/src/Makefile.am b/src/Makefile.am
-index ccae77d..1d697b8 100644
+index ccae77d..5f82df4 100644
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
 @@ -3,6 +3,9 @@ AUTOMAKE_OPTIONS = 1.7
@@ -32,7 +41,7 @@ index ccae77d..1d697b8 100644
  saverdir = $(libexecdir)/light-locker
  
  AM_CPPFLAGS =							\
-@@ -114,6 +117,25 @@ preview_LDADD =		\
+@@ -114,6 +117,29 @@ preview_LDADD =		\
  	$(SAVER_LIBS)			\
  	$(NULL)
  
@@ -50,6 +59,10 @@ index ccae77d..1d697b8 100644
 +	$(BUILT_SOURCES)	\
 +	$(NULL)
 +
++# the harness reports logind's seats directory as present (the listener's
++# path on the target); only the listener's references are redirected
++test_listener_inhibit_LDFLAGS = -Wl,--wrap=access
++
 +test_listener_inhibit_LDADD =	\
 +	$(LIGHT_LOCKER_LIBS)	\
 +	$(SYSTEMD_LIBS)		\
@@ -60,10 +73,10 @@ index ccae77d..1d697b8 100644
  	gs-marshal.list			\
 diff --git a/src/test-listener-inhibit.c b/src/test-listener-inhibit.c
 new file mode 100644
-index 0000000..bedfc15
+index 0000000..29e1d93
 --- /dev/null
 +++ b/src/test-listener-inhibit.c
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,700 @@
 +/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
 + *
 + * Tests of light-locker's org.freedesktop.ScreenSaver inhibitors as the
@@ -81,6 +94,7 @@ index 0000000..bedfc15
 +#include "config.h"
 +
 +#include <string.h>
++#include <unistd.h>
 +#include <gio/gio.h>
 +
 +#include "gs-listener-dbus.h"
@@ -95,6 +109,81 @@ index 0000000..bedfc15
 +#define WAIT_MS 5000
 +
 +static GTestDBus *bus;
++static GTestDBus *system_bus;
++
++/* The listener looks for its logind session at start (as on the target)
++ * and stops without one. The harness gives it what logind would: the seats
++ * directory (linked with --wrap=access, so only the listener's own
++ * references see this) and a stand-in org.freedesktop.login1 on a private
++ * system bus, served from its own thread because the listener asks it
++ * with blocking calls. */
++int __real_access (const char *path, int mode);
++
++int
++__wrap_access (const char *path, int mode)
++{
++        if (g_strcmp0 (path, "/run/systemd/seats/") == 0)
++                return 0;
++        return __real_access (path, mode);
++}
++
++static const char logind_xml[] =
++        "<node>"
++        "  <interface name='org.freedesktop.login1.Manager'>"
++        "    <method name='GetSessionByPID'>"
++        "      <arg type='u' direction='in'/><arg type='o' direction='out'/>"
++        "    </method>"
++        "  </interface>"
++        "</node>";
++
++static gint logind_ready;
++static gint logind_calls;
++
++static void
++logind_method (GDBusConnection       *connection,
++               const char            *sender,
++               const char            *path,
++               const char            *iface,
++               const char            *method,
++               GVariant              *parameters,
++               GDBusMethodInvocation *invocation,
++               gpointer               data)
++{
++        g_atomic_int_inc (&logind_calls);
++        g_dbus_method_invocation_return_value (invocation,
++                                               g_variant_new ("(o)", "/org/freedesktop/login1/session/test"));
++}
++
++static const GDBusInterfaceVTable logind_vtable = { logind_method, NULL, NULL };
++
++static void
++logind_name_acquired (GDBusConnection *connection, const char *name, gpointer data)
++{
++        g_atomic_int_set (&logind_ready, 1);
++}
++
++static gpointer
++logind_thread (gpointer address)
++{
++        GMainContext *context = g_main_context_new ();
++        GDBusConnection *connection;
++        GDBusNodeInfo *info;
++
++        g_main_context_push_thread_default (context);
++        connection = g_dbus_connection_new_for_address_sync (address,
++                                                             G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
++                                                             G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
++                                                             NULL, NULL, NULL);
++        g_assert_nonnull (connection);
++        info = g_dbus_node_info_new_for_xml (logind_xml, NULL);
++        g_dbus_connection_register_object (connection, "/org/freedesktop/login1",
++                                           info->interfaces[0], &logind_vtable, NULL, NULL, NULL);
++        g_bus_own_name_on_connection (connection, "org.freedesktop.login1", G_BUS_NAME_OWNER_FLAGS_NONE,
++                                      logind_name_acquired, NULL, NULL, NULL);
++        for (;;)
++                g_main_context_iteration (context, TRUE);
++        return NULL;
++}
 +
 +/* the stand-in session manager */
 +
@@ -580,6 +669,25 @@ index 0000000..bedfc15
 +        close_connection (caller);
 +}
 +
++static gboolean
++name_has_owner (const char *name)
++{
++        GDBusConnection *connection = new_connection ();
++        GVariant *reply;
++        gboolean owned = FALSE;
++
++        reply = g_dbus_connection_call_sync (connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
++                                             "org.freedesktop.DBus", "NameHasOwner",
++                                             g_variant_new ("(s)", name), G_VARIANT_TYPE ("(b)"),
++                                             G_DBUS_CALL_FLAGS_NONE, WAIT_MS, NULL, NULL);
++        if (reply != NULL) {
++                g_variant_get (reply, "(b)", &owned);
++                g_variant_unref (reply);
++        }
++        close_connection (connection);
++        return owned;
++}
++
 +typedef struct {
 +        const char *path;
 +        void      (*func) (void);
@@ -604,17 +712,41 @@ index 0000000..bedfc15
 +        if (g_test_subprocess ()) {
 +                GSListener *listener;
 +                GError *error = NULL;
++                gint64 start, end;
++
++                /* the system bus first: bringing up a GTestDBus sets the
++                 * session bus address */
++                system_bus = g_test_dbus_new (G_TEST_DBUS_NONE);
++                g_test_dbus_up (system_bus);
++                g_setenv ("DBUS_SYSTEM_BUS_ADDRESS", g_test_dbus_get_bus_address (system_bus), TRUE);
++                g_thread_unref (g_thread_new ("logind", logind_thread,
++                                              (gpointer) g_test_dbus_get_bus_address (system_bus)));
++                end = g_get_monotonic_time () + WAIT_MS * 1000;
++                while (!g_atomic_int_get (&logind_ready) && g_get_monotonic_time () < end)
++                        g_usleep (10000);
++                if (!g_atomic_int_get (&logind_ready))
++                        g_error ("harness: the stand-in logind did not get its name");
 +
 +                bus = g_test_dbus_new (G_TEST_DBUS_NONE);
 +                g_test_dbus_up (bus);
++                g_setenv ("XDG_SESSION_PATH", "/org/freedesktop/DisplayManager/Session0", TRUE);
++                g_unsetenv ("XDG_SESSION_ID");
 +
++                start = g_get_monotonic_time ();
 +                listener = gs_listener_new ();
++                if (g_get_monotonic_time () - start > 3 * G_USEC_PER_SEC)
++                        g_error ("harness: gs_listener_new took more than 3 s");
++                if (g_atomic_int_get (&logind_calls) == 0)
++                        g_error ("harness: the listener did not ask the stand-in logind");
 +                g_signal_connect (listener, "inhibit", G_CALLBACK (on_inhibit), NULL);
-+                g_assert_true (gs_listener_acquire (listener, &error));
-+                g_assert_no_error (error);
++                if (!gs_listener_acquire (listener, &error))
++                        g_error ("harness: gs_listener_acquire failed: %s", error ? error->message : "?");
++                if (!name_has_owner (SS_NAME) || !name_has_owner ("org.gnome.ScreenSaver"))
++                        g_error ("harness: the listener does not own the ScreenSaver names");
 +
 +                c->func ();
 +                g_test_dbus_stop (bus);
++                g_test_dbus_stop (system_bus);
 +                return;
 +        }
 +
