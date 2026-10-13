@@ -5,3 +5,5 @@
 0005-Report-the-lock-state-in-GetActive-and-to-logind.patch
 0006-Forward-ScreenSaver-inhibitors-to-the-session-manage.patch
 0007-Test-ScreenSaver-inhibitors-as-the-session-manager-s.patch
+0008-Do-not-arm-the-lock-timer-after-the-screensaver-in-a.patch
+0009-Test-the-lock-timer-after-the-screensaver-per-deskto.patch

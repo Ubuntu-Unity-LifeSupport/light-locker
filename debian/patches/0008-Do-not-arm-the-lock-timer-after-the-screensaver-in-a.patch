@@ -1,0 +1,139 @@
+From: NeiroNext <mihail.rozshko@gmail.com>
+Date: Tue, 13 Oct 2026 21:12:01 +0000
+Subject: Do not arm the lock timer after the screensaver in a Unity session
+
+In a Unity session Unity asks for the blank (SetActive) when the session
+goes idle and decides itself whether and when to lock, from
+org.gnome.desktop.screensaver lock-enabled and lock-delay. The timer that
+locks lock-after-screensaver seconds after the blank would lock regardless
+of those settings, so it is not armed when XDG_CURRENT_DESKTOP lists Unity.
+The lock-after-screensaver setting itself is not changed: light-locker
+writes its settings back at start, so a different default would not take
+effect for existing users and would carry over to other desktops.
+
+Forwarded: no
+Last-Update: 2026-10-13
+---
+ src/Makefile.am     |  2 ++
+ src/gs-lock-after.c | 33 +++++++++++++++++++++++++++++++++
+ src/gs-lock-after.h | 23 +++++++++++++++++++++++
+ src/gs-monitor.c    |  9 +++++++--
+ 4 files changed, 65 insertions(+), 2 deletions(-)
+ create mode 100644 src/gs-lock-after.c
+ create mode 100644 src/gs-lock-after.h
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 5f82df4..bd22e29 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -78,6 +78,8 @@ light_locker_SOURCES =	\
+ 	gs-bus.h		\
+ 	gs-monitor.c		\
+ 	gs-monitor.h		\
++	gs-lock-after.c		\
++	gs-lock-after.h		\
+ 	gs-listener-dbus.c	\
+ 	gs-listener-dbus.h	\
+ 	gs-listener-x11.c	\
+diff --git a/src/gs-lock-after.c b/src/gs-lock-after.c
+new file mode 100644
+index 0000000..511736c
+--- /dev/null
++++ b/src/gs-lock-after.c
+@@ -0,0 +1,33 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
++ *
++ * The lock timer after the screensaver starts, per desktop
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include "gs-lock-after.h"
++
++/* In a Unity session Unity asks for the blank and decides whether and when
++ * to lock, from the desktop's screensaver settings, so no lock timer of our
++ * own is armed.  The setting itself is left as it is. */
++guint
++gs_lock_after_for_desktop (guint       configured,
++                           const char *current_desktop)
++{
++        gchar  **desktops;
++        gboolean unity;
++
++        if (current_desktop == NULL || *current_desktop == '\0')
++                return configured;
++
++        desktops = g_strsplit (current_desktop, ":", -1);
++        unity = g_strv_contains ((const gchar * const *) desktops, "Unity");
++        g_strfreev (desktops);
++
++        return unity ? 0 : configured;
++}
+diff --git a/src/gs-lock-after.h b/src/gs-lock-after.h
+new file mode 100644
+index 0000000..32e53b3
+--- /dev/null
++++ b/src/gs-lock-after.h
+@@ -0,0 +1,23 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
++ *
++ * The lock timer after the screensaver starts, per desktop
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef __GS_LOCK_AFTER_H
++#define __GS_LOCK_AFTER_H
++
++#include <glib.h>
++
++G_BEGIN_DECLS
++
++guint gs_lock_after_for_desktop (guint       configured,
++                                 const char *current_desktop);
++
++G_END_DECLS
++
++#endif /* __GS_LOCK_AFTER_H */
+diff --git a/src/gs-monitor.c b/src/gs-monitor.c
+index f0e2592..dff3425 100644
+--- a/src/gs-monitor.c
++++ b/src/gs-monitor.c
+@@ -38,6 +38,7 @@
+ #include "gs-listener-x11.h"
+ #include "gs-monitor.h"
+ #include "gs-debug.h"
++#include "gs-lock-after.h"
+ 
+ static void     gs_monitor_class_init (GSMonitorClass *klass);
+ static void     gs_monitor_init       (GSMonitor      *monitor);
+@@ -202,7 +203,9 @@ conf_lock_after_screensaver_cb (LLConfig    *conf,
+                       "lock-after-screensaver", &lock_after_screensaver,
+                       NULL);
+ 
+-        gs_manager_set_lock_after (monitor->priv->manager, lock_after_screensaver);
++        gs_manager_set_lock_after (monitor->priv->manager,
++                                   gs_lock_after_for_desktop (lock_after_screensaver,
++                                                              g_getenv ("XDG_CURRENT_DESKTOP")));
+ }
+ 
+ static void
+@@ -610,7 +613,9 @@ gs_monitor_new (LLConfig *config)
+         monitor->priv->lock_on_lid = lock_on_lid;
+         monitor->priv->idle_hint = idle_hint;
+ 
+-        gs_manager_set_lock_after (monitor->priv->manager, lock_after_screensaver);
++        gs_manager_set_lock_after (monitor->priv->manager,
++                                   gs_lock_after_for_desktop (lock_after_screensaver,
++                                                              g_getenv ("XDG_CURRENT_DESKTOP")));
+ 
+         if (lock_on_suspend) {
+               gs_listener_delay_suspend (monitor->priv->listener);

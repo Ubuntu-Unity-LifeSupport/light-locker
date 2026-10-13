@@ -1,0 +1,111 @@
+From: NeiroNext <mihail.rozshko@gmail.com>
+Date: Tue, 13 Oct 2026 21:12:26 +0000
+Subject: Test the lock timer after the screensaver per desktop
+
+test-lock-after runs in make check: in a Unity session (Unity listed in
+XDG_CURRENT_DESKTOP, as a whole name) no timer is armed; on other
+desktops, and without XDG_CURRENT_DESKTOP, the configured value is used.
+
+Forwarded: no
+Last-Update: 2026-10-13
+---
+ src/Makefile.am       | 12 ++++++++++-
+ src/test-lock-after.c | 59 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+), 1 deletion(-)
+ create mode 100644 src/test-lock-after.c
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index bd22e29..eb79c3d 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -119,7 +119,7 @@ preview_LDADD =		\
+ 	$(SAVER_LIBS)			\
+ 	$(NULL)
+ 
+-check_PROGRAMS = test-listener-inhibit
++check_PROGRAMS = test-listener-inhibit test-lock-after
+ TESTS = $(check_PROGRAMS)
+ 
+ test_listener_inhibit_SOURCES =	\
+@@ -142,6 +142,16 @@ test_listener_inhibit_LDADD =	\
+ 	$(SYSTEMD_LIBS)		\
+ 	$(NULL)
+ 
++test_lock_after_SOURCES =	\
++	test-lock-after.c	\
++	gs-lock-after.c		\
++	gs-lock-after.h		\
++	$(NULL)
++
++test_lock_after_LDADD =		\
++	$(LIGHT_LOCKER_LIBS)	\
++	$(NULL)
++
+ EXTRA_DIST =				\
+ 	debug-screensaver.sh		\
+ 	gs-marshal.list			\
+diff --git a/src/test-lock-after.c b/src/test-lock-after.c
+new file mode 100644
+index 0000000..8f99892
+--- /dev/null
++++ b/src/test-lock-after.c
+@@ -0,0 +1,59 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
++ *
++ * The lock timer after the screensaver starts, per desktop
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include <glib.h>
++
++#include "gs-lock-after.h"
++
++static void
++test_unity_session (void)
++{
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, "Unity:Unity7:ubuntu"), ==, 0);
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, "Unity"), ==, 0);
++        g_assert_cmpuint (gs_lock_after_for_desktop (30, "ubuntu:Unity"), ==, 0);
++}
++
++static void
++test_other_desktops (void)
++{
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, "XFCE"), ==, 5);
++        g_assert_cmpuint (gs_lock_after_for_desktop (30, "X-Cinnamon"), ==, 30);
++        g_assert_cmpuint (gs_lock_after_for_desktop (0, "XFCE"), ==, 0);
++}
++
++static void
++test_whole_names_only (void)
++{
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, "UnityX"), ==, 5);
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, "unity"), ==, 5);
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, "Unity7:ubuntu"), ==, 5);
++}
++
++static void
++test_no_desktop (void)
++{
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, NULL), ==, 5);
++        g_assert_cmpuint (gs_lock_after_for_desktop (5, ""), ==, 5);
++}
++
++int
++main (int argc, char **argv)
++{
++        g_test_init (&argc, &argv, NULL);
++
++        g_test_add_func ("/lock-after/unity-session", test_unity_session);
++        g_test_add_func ("/lock-after/other-desktops", test_other_desktops);
++        g_test_add_func ("/lock-after/whole-names-only", test_whole_names_only);
++        g_test_add_func ("/lock-after/no-desktop", test_no_desktop);
++
++        return g_test_run ();
++}
