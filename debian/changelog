@@ -13,7 +13,7 @@ light-locker (1.8.0-3ubuntu4+unity5) resolute; urgency=medium
     unchanged.
   * d/p/0011: tests of the above in make check (private session bus).
 
- -- NeiroNext <mihail.rozshko@gmail.com>  Sat, 17 Oct 2026 06:02:21 +0000
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Sat, 17 Oct 2026 06:02:21 +0000
 
 light-locker (1.8.0-3ubuntu4+unity4) resolute; urgency=medium
 
