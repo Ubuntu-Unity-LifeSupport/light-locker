@@ -1,0 +1,421 @@
+From: NeiroNext <mihail.rozshko@gmail.com>
+Date: Sat, 17 Oct 2026 05:39:45 +0000
+Subject: Test how the listener takes its names, per desktop
+
+test-listener-inhibit gets listener-acquire cases on its private session
+bus. Every case sets XDG_CURRENT_DESKTOP; the inhibitor cases run with
+XFCE. The stand-in logind records SetLockedHint, and the harness can make
+the listener's request for one name fail with an error
+(--wrap=dbus_bus_request_name).
+
+ - unity_desktop_freedesktop_name_taken: another connection owns
+   org.freedesktop.ScreenSaver; light-locker starts, owns
+   org.gnome.ScreenSaver, the other keeps its name, one
+   SetLockedHint(false).
+ - other_desktop_freedesktop_name_taken: the same on XFCE; light-locker
+   stops and takes no name.
+ - unity_desktop_gnome_name_taken: one other connection owns both names;
+   light-locker stops, both names keep their owner, no NameOwnerChanged,
+   no SetLockedHint.
+ - unity_desktop_freedesktop_free: light-locker owns both names.
+ - unity_desktop_freedesktop_request_error: the request for
+   org.freedesktop.ScreenSaver fails; light-locker starts with
+   org.gnome.ScreenSaver, no error, one SetLockedHint(false).
+ - unity_desktop_gnome_request_error: the request for
+   org.gnome.ScreenSaver fails; light-locker stops, holds neither name,
+   no SetLockedHint.
+
+Forwarded: no
+Last-Update: 2026-10-17
+---
+ src/Makefile.am             |   5 +-
+ src/test-listener-inhibit.c | 289 ++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 284 insertions(+), 10 deletions(-)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 9e1f109..2aba2ec 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -136,8 +136,9 @@ test_listener_inhibit_SOURCES =	\
+ 	$(NULL)
+ 
+ # the harness reports logind's seats directory as present (the listener's
+-# path on the target); only the listener's references are redirected
+-test_listener_inhibit_LDFLAGS = -Wl,--wrap=access
++# path on the target) and can make a name request fail; only the
++# listener's references are redirected
++test_listener_inhibit_LDFLAGS = -Wl,--wrap=access,--wrap=dbus_bus_request_name
+ 
+ test_listener_inhibit_LDADD =	\
+ 	$(LIGHT_LOCKER_LIBS)	\
+diff --git a/src/test-listener-inhibit.c b/src/test-listener-inhibit.c
+index 46c0472..d10ce35 100644
+--- a/src/test-listener-inhibit.c
++++ b/src/test-listener-inhibit.c
+@@ -6,6 +6,9 @@
+  * and answers when the test says so, and callers on their own connections.
+  * Every case runs in its own process; waits are bounded.
+  *
++ * The listener-acquire cases test how the listener takes its names at
++ * start, per desktop.
++ *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+@@ -17,11 +20,13 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <gio/gio.h>
++#include <dbus/dbus.h>
+ 
+ #include "gs-listener-dbus.h"
+ #include "gs-debug.h"
+ 
+ #define SS_NAME      "org.freedesktop.ScreenSaver"
++#define GSS_NAME     "org.gnome.ScreenSaver"
+ #define SS_PATH      "/org/freedesktop/ScreenSaver"
+ #define SS_PATH_KDE  "/ScreenSaver"
+ #define SM_NAME      "org.gnome.SessionManager"
+@@ -48,6 +53,24 @@ __wrap_access (const char *path, int mode)
+         return __real_access (path, mode);
+ }
+ 
++/* A case can make the listener's request for one name fail as the bus
++ * library does on an error (--wrap=dbus_bus_request_name). */
++static const char *failing_name;
++
++int __real_dbus_bus_request_name (DBusConnection *connection, const char *name,
++                                  unsigned int flags, DBusError *error);
++
++int
++__wrap_dbus_bus_request_name (DBusConnection *connection, const char *name,
++                              unsigned int flags, DBusError *error)
++{
++        if (g_strcmp0 (name, failing_name) == 0) {
++                dbus_set_error (error, DBUS_ERROR_FAILED, "harness: request for %s failed", name);
++                return -1;
++        }
++        return __real_dbus_bus_request_name (connection, name, flags, error);
++}
++
+ static const char logind_xml[] =
+         "<node>"
+         "  <interface name='org.freedesktop.login1.Manager'>"
+@@ -55,10 +78,15 @@ static const char logind_xml[] =
+         "      <arg type='u' direction='in'/><arg type='o' direction='out'/>"
+         "    </method>"
+         "  </interface>"
++        "  <interface name='org.freedesktop.login1.Session'>"
++        "    <method name='SetLockedHint'><arg type='b' direction='in'/></method>"
++        "  </interface>"
+         "</node>";
+ 
+ static gint logind_ready;
+ static gint logind_calls;
++static gint locked_hint_calls;
++static gint locked_hint_true_calls;
+ 
+ static void
+ logind_method (GDBusConnection       *connection,
+@@ -70,6 +98,17 @@ logind_method (GDBusConnection       *connection,
+                GDBusMethodInvocation *invocation,
+                gpointer               data)
+ {
++        gboolean locked;
++
++        if (g_strcmp0 (method, "SetLockedHint") == 0) {
++                g_variant_get (parameters, "(b)", &locked);
++                if (locked)
++                        g_atomic_int_inc (&locked_hint_true_calls);
++                g_atomic_int_inc (&locked_hint_calls);
++                g_dbus_method_invocation_return_value (invocation, NULL);
++                return;
++        }
++
+         g_atomic_int_inc (&logind_calls);
+         g_dbus_method_invocation_return_value (invocation,
+                                                g_variant_new ("(o)", "/org/freedesktop/login1/session/test"));
+@@ -99,6 +138,8 @@ logind_thread (gpointer address)
+         info = g_dbus_node_info_new_for_xml (logind_xml, NULL);
+         g_dbus_connection_register_object (connection, "/org/freedesktop/login1",
+                                            info->interfaces[0], &logind_vtable, NULL, NULL, NULL);
++        g_dbus_connection_register_object (connection, "/org/freedesktop/login1/session/test",
++                                           info->interfaces[1], &logind_vtable, NULL, NULL, NULL);
+         g_bus_own_name_on_connection (connection, "org.freedesktop.login1", G_BUS_NAME_OWNER_FLAGS_NONE,
+                                       logind_name_acquired, NULL, NULL, NULL);
+         for (;;)
+@@ -605,20 +646,245 @@ name_has_owner (const char *name)
+         return owned;
+ }
+ 
++static char *
++name_owner (GDBusConnection *connection, const char *name)
++{
++        GVariant *reply;
++        char *owner = NULL;
++
++        reply = g_dbus_connection_call_sync (connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
++                                             "org.freedesktop.DBus", "GetNameOwner",
++                                             g_variant_new ("(s)", name), G_VARIANT_TYPE ("(s)"),
++                                             G_DBUS_CALL_FLAGS_NONE, WAIT_MS, NULL, NULL);
++        if (reply != NULL) {
++                g_variant_get (reply, "(s)", &owner);
++                g_variant_unref (reply);
++        }
++        return owner;
++}
++
++static void
++take_name (GDBusConnection *connection, const char *name)
++{
++        GVariant *reply;
++        guint result = 0;
++
++        reply = g_dbus_connection_call_sync (connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
++                                             "org.freedesktop.DBus", "RequestName",
++                                             g_variant_new ("(su)", name, DBUS_NAME_FLAG_DO_NOT_QUEUE),
++                                             G_VARIANT_TYPE ("(u)"), G_DBUS_CALL_FLAGS_NONE, WAIT_MS,
++                                             NULL, NULL);
++        g_assert_nonnull (reply);
++        g_variant_get (reply, "(u)", &result);
++        g_variant_unref (reply);
++        g_assert_cmpuint (result, ==, DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER);
++}
++
++/* light-locker owns the name: an owner, and none of the test's connections */
++static void
++assert_listener_owns (GDBusConnection *test, GDBusConnection *other, const char *name)
++{
++        char *owner = name_owner (test, name);
++
++        g_assert_nonnull (owner);
++        g_assert_cmpstr (owner, !=, g_dbus_connection_get_unique_name (test));
++        if (other != NULL)
++                g_assert_cmpstr (owner, !=, g_dbus_connection_get_unique_name (other));
++        g_free (owner);
++}
++
++static void
++assert_owner (GDBusConnection *test, const char *name, GDBusConnection *expected)
++{
++        char *owner = name_owner (test, name);
++
++        g_assert_cmpstr (owner, ==, expected != NULL ? g_dbus_connection_get_unique_name (expected) : NULL);
++        g_free (owner);
++}
++
++static gboolean
++locked_hint_sent (gpointer data)
++{
++        return g_atomic_int_get (&locked_hint_calls) > 0;
++}
++
++/* exactly one SetLockedHint(false) */
++static void
++assert_one_locked_hint_false (void)
++{
++        g_assert_true (wait_until (locked_hint_sent, NULL));
++        spin (300);
++        g_assert_cmpint (g_atomic_int_get (&locked_hint_calls), ==, 1);
++        g_assert_cmpint (g_atomic_int_get (&locked_hint_true_calls), ==, 0);
++}
++
++static void
++assert_no_locked_hint (void)
++{
++        spin (300);
++        g_assert_cmpint (g_atomic_int_get (&locked_hint_calls), ==, 0);
++}
++
++static guint owner_changes;
++
++static void
++on_name_owner_changed (GDBusConnection *connection, const char *sender, const char *path,
++                       const char *iface, const char *signal, GVariant *parameters, gpointer data)
++{
++        owner_changes++;
++}
++
++static void
++watch_owner_changes (GDBusConnection *watcher, const char *name)
++{
++        g_dbus_connection_signal_subscribe (watcher, "org.freedesktop.DBus", "org.freedesktop.DBus",
++                                            "NameOwnerChanged", "/org/freedesktop/DBus", name,
++                                            G_DBUS_SIGNAL_FLAGS_NONE, on_name_owner_changed,
++                                            NULL, NULL);
++        /* a round trip: the bus has the match before anything else happens */
++        g_free (name_owner (watcher, "org.freedesktop.DBus"));
++}
++
++/* Unity desktop, another connection owns org.freedesktop.ScreenSaver:
++ * light-locker starts with org.gnome.ScreenSaver, the other keeps its name */
++static void
++test_unity_desktop_freedesktop_name_taken (GSListener *listener)
++{
++        GDBusConnection *test = new_connection ();
++        GDBusConnection *other = new_connection ();
++        GError *error = NULL;
++
++        take_name (other, SS_NAME);
++        g_assert_true (gs_listener_acquire (listener, &error));
++        g_assert_no_error (error);
++        assert_listener_owns (test, other, GSS_NAME);
++        assert_owner (test, SS_NAME, other);
++        assert_one_locked_hint_false ();
++        close_connection (other);
++        close_connection (test);
++}
++
++/* other desktops: light-locker stops as before */
++static void
++test_other_desktop_freedesktop_name_taken (GSListener *listener)
++{
++        GDBusConnection *test = new_connection ();
++        GDBusConnection *other = new_connection ();
++        GError *error = NULL;
++
++        take_name (other, SS_NAME);
++        g_assert_false (gs_listener_acquire (listener, &error));
++        g_assert_nonnull (error);
++        g_clear_error (&error);
++        assert_owner (test, SS_NAME, other);
++        assert_owner (test, GSS_NAME, NULL);
++        assert_no_locked_hint ();
++        close_connection (other);
++        close_connection (test);
++}
++
++/* Unity desktop, one other connection owns both names, as a running
++ * light-locker does: light-locker stops, nothing changes */
++static void
++test_unity_desktop_gnome_name_taken (GSListener *listener)
++{
++        GDBusConnection *test = new_connection ();
++        GDBusConnection *other = new_connection ();
++        GError *error = NULL;
++
++        take_name (other, SS_NAME);
++        take_name (other, GSS_NAME);
++        watch_owner_changes (test, SS_NAME);
++        watch_owner_changes (test, GSS_NAME);
++        g_assert_false (gs_listener_acquire (listener, &error));
++        g_assert_nonnull (error);
++        g_clear_error (&error);
++        assert_no_locked_hint ();
++        g_assert_cmpuint (owner_changes, ==, 0);
++        assert_owner (test, SS_NAME, other);
++        assert_owner (test, GSS_NAME, other);
++        close_connection (other);
++        close_connection (test);
++}
++
++/* Unity desktop, both names free: light-locker owns both */
++static void
++test_unity_desktop_freedesktop_free (GSListener *listener)
++{
++        GDBusConnection *test = new_connection ();
++        GError *error = NULL;
++
++        g_assert_true (gs_listener_acquire (listener, &error));
++        g_assert_no_error (error);
++        assert_listener_owns (test, NULL, GSS_NAME);
++        assert_listener_owns (test, NULL, SS_NAME);
++        assert_one_locked_hint_false ();
++        close_connection (test);
++}
++
++/* Unity desktop, the request for org.freedesktop.ScreenSaver fails with an
++ * error: light-locker starts with org.gnome.ScreenSaver, no error */
++static void
++test_unity_desktop_freedesktop_request_error (GSListener *listener)
++{
++        GDBusConnection *test = new_connection ();
++        GError *error = NULL;
++
++        failing_name = SS_NAME;
++        g_assert_true (gs_listener_acquire (listener, &error));
++        g_assert_no_error (error);
++        assert_listener_owns (test, NULL, GSS_NAME);
++        assert_owner (test, SS_NAME, NULL);
++        assert_one_locked_hint_false ();
++        close_connection (test);
++}
++
++/* Unity desktop, the request for org.gnome.ScreenSaver fails with an
++ * error: light-locker stops before taking any name or writing the hint */
++static void
++test_unity_desktop_gnome_request_error (GSListener *listener)
++{
++        GDBusConnection *test = new_connection ();
++        GError *error = NULL;
++
++        failing_name = GSS_NAME;
++        g_assert_false (gs_listener_acquire (listener, &error));
++        g_assert_nonnull (error);
++        g_clear_error (&error);
++        assert_owner (test, SS_NAME, NULL);
++        assert_owner (test, GSS_NAME, NULL);
++        assert_no_locked_hint ();
++        close_connection (test);
++}
++
+ typedef struct {
+         const char *path;
+         void      (*func) (void);
++        const char *desktop;
++        void      (*acquire) (GSListener *listener);
+ } Case;
+ 
+ static const Case cases[] = {
+-        { "/listener-inhibit/forward", test_forward },
+-        { "/listener-inhibit/uninhibit", test_uninhibit },
+-        { "/listener-inhibit/release-before-reply", test_release_before_reply },
+-        { "/listener-inhibit/caller-vanishes", test_caller_vanishes },
+-        { "/listener-inhibit/well-known-name-change", test_well_known_name_change },
+-        { "/listener-inhibit/no-session-manager", test_no_session_manager },
+-        { "/listener-inhibit/empty-strings", test_empty_strings },
+-        { "/listener-inhibit/session-manager-changes", test_session_manager_changes },
++        { "/listener-inhibit/forward", test_forward, "XFCE" },
++        { "/listener-inhibit/uninhibit", test_uninhibit, "XFCE" },
++        { "/listener-inhibit/release-before-reply", test_release_before_reply, "XFCE" },
++        { "/listener-inhibit/caller-vanishes", test_caller_vanishes, "XFCE" },
++        { "/listener-inhibit/well-known-name-change", test_well_known_name_change, "XFCE" },
++        { "/listener-inhibit/no-session-manager", test_no_session_manager, "XFCE" },
++        { "/listener-inhibit/empty-strings", test_empty_strings, "XFCE" },
++        { "/listener-inhibit/session-manager-changes", test_session_manager_changes, "XFCE" },
++        { "/listener-acquire/unity_desktop_freedesktop_name_taken", NULL, "Unity:Unity7:ubuntu",
++          test_unity_desktop_freedesktop_name_taken },
++        { "/listener-acquire/other_desktop_freedesktop_name_taken", NULL, "XFCE",
++          test_other_desktop_freedesktop_name_taken },
++        { "/listener-acquire/unity_desktop_gnome_name_taken", NULL, "Unity:Unity7:ubuntu",
++          test_unity_desktop_gnome_name_taken },
++        { "/listener-acquire/unity_desktop_freedesktop_free", NULL, "Unity:Unity7:ubuntu",
++          test_unity_desktop_freedesktop_free },
++        { "/listener-acquire/unity_desktop_freedesktop_request_error", NULL, "Unity:Unity7:ubuntu",
++          test_unity_desktop_freedesktop_request_error },
++        { "/listener-acquire/unity_desktop_gnome_request_error", NULL, "Unity:Unity7:ubuntu",
++          test_unity_desktop_gnome_request_error },
+ };
+ 
+ static void
+@@ -648,6 +914,7 @@ run_case (gconstpointer data)
+                 g_test_dbus_up (bus);
+                 g_setenv ("XDG_SESSION_PATH", "/org/freedesktop/DisplayManager/Session0", TRUE);
+                 g_unsetenv ("XDG_SESSION_ID");
++                g_setenv ("XDG_CURRENT_DESKTOP", c->desktop, TRUE);
+ 
+                 start = g_get_monotonic_time ();
+                 listener = gs_listener_new ();
+@@ -655,6 +922,12 @@ run_case (gconstpointer data)
+                         g_error ("harness: gs_listener_new took more than 3 s");
+                 if (g_atomic_int_get (&logind_calls) == 0)
+                         g_error ("harness: the listener did not ask the stand-in logind");
++                if (c->acquire != NULL) {
++                        c->acquire (listener);
++                        g_test_dbus_stop (bus);
++                        g_test_dbus_stop (system_bus);
++                        return;
++                }
+                 g_signal_connect (listener, "inhibit", G_CALLBACK (on_inhibit), NULL);
+                 if (!gs_listener_acquire (listener, &error))
+                         g_error ("harness: gs_listener_acquire failed: %s", error ? error->message : "?");

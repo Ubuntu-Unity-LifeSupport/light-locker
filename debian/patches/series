@@ -7,3 +7,5 @@
 0007-Test-ScreenSaver-inhibitors-as-the-session-manager-s.patch
 0008-Do-not-arm-the-lock-timer-after-the-screensaver-in-a.patch
 0009-Test-the-lock-timer-after-the-screensaver-per-deskto.patch
+0010-Request-org.gnome.ScreenSaver-first-and-alone-decisi.patch
+0011-Test-how-the-listener-takes-its-names-per-desktop.patch
