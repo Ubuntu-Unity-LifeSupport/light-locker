@@ -29,12 +29,12 @@ gs_desktop_is_unity () and tested in test-lock-after.
 Forwarded: no
 Last-Update: 2026-10-17
 ---
- src/Makefile.am        |   2 +
- src/gs-listener-dbus.c | 130 +++++++++++++++++++++++++++++++++----------------
- src/gs-lock-after.c    |  22 ++++++---
- src/gs-lock-after.h    |   2 +
- src/test-lock-after.c  |  10 ++++
- 5 files changed, 115 insertions(+), 51 deletions(-)
+ src/Makefile.am        |  2 ++
+ src/gs-listener-dbus.c | 52 +++++++++++++++++++++++++++++++++++++++++++++++---
+ src/gs-lock-after.c    | 22 +++++++++++++--------
+ src/gs-lock-after.h    |  2 ++
+ src/test-lock-after.c  | 10 ++++++++++
+ 5 files changed, 77 insertions(+), 11 deletions(-)
 
 diff --git a/src/Makefile.am b/src/Makefile.am
 index eb79c3d..9e1f109 100644
@@ -50,7 +50,7 @@ index eb79c3d..9e1f109 100644
  	gs-debug.h		\
  	gs-bus.h		\
 diff --git a/src/gs-listener-dbus.c b/src/gs-listener-dbus.c
-index d2b9c96..2b2d930 100644
+index d2b9c96..6381fd0 100644
 --- a/src/gs-listener-dbus.c
 +++ b/src/gs-listener-dbus.c
 @@ -52,6 +52,7 @@
@@ -104,29 +104,10 @@ index d2b9c96..2b2d930 100644
                  g_set_error (error,
                               GS_LISTENER_ERROR,
                               GS_LISTENER_ERROR_ACQUISITION_FAILURE,
-@@ -2007,49 +2015,85 @@ gs_listener_acquire (GSListener *listener,
+@@ -2007,6 +2015,43 @@ gs_listener_acquire (GSListener *listener,
                  return FALSE;
          }
  
--        res = dbus_bus_request_name (listener->priv->connection,
--                                     GS_SERVICE,
--                                     DBUS_NAME_FLAG_DO_NOT_QUEUE,
--                                     &buserror);
--        if (dbus_error_is_set (&buserror)) {
--                g_set_error (error,
--                             GS_LISTENER_ERROR,
--                             GS_LISTENER_ERROR_ACQUISITION_FAILURE,
--                             "%s",
--                             buserror.message);
--        }
--        if (res == DBUS_REQUEST_NAME_REPLY_EXISTS) {
--                g_set_error (error,
--                             GS_LISTENER_ERROR,
--                             GS_LISTENER_ERROR_ACQUISITION_FAILURE,
--                             "%s",
--                             _("screensaver already running in this session"));
--                return FALSE;
--        }
 +        /* In a Unity session only org.gnome.ScreenSaver decides:
 +         * org.freedesktop.ScreenSaver may be held by unity-settings-daemon's
 +         * screensaver proxy, which forwards its lock calls to
@@ -148,8 +129,7 @@ index d2b9c96..2b2d930 100644
 +                        dbus_error_free (&buserror);
 +                        return FALSE;
 +                }
- 
--        dbus_error_free (&buserror);
++
 +                freedesktop_res = dbus_bus_request_name (listener->priv->connection,
 +                                                         GS_SERVICE,
 +                                                         DBUS_NAME_FLAG_DO_NOT_QUEUE,
@@ -162,74 +142,20 @@ index d2b9c96..2b2d930 100644
 +                                  dbus_error_is_set (&buserror) ? buserror.message : "owned by another connection");
 +                        dbus_error_free (&buserror);
 +                }
-+        } else {
-+                res = dbus_bus_request_name (listener->priv->connection,
-+                                             GS_SERVICE,
-+                                             DBUS_NAME_FLAG_DO_NOT_QUEUE,
-+                                             &buserror);
-+                if (dbus_error_is_set (&buserror)) {
-+                        g_set_error (error,
-+                                     GS_LISTENER_ERROR,
-+                                     GS_LISTENER_ERROR_ACQUISITION_FAILURE,
-+                                     "%s",
-+                                     buserror.message);
-+                }
-+                if (res == DBUS_REQUEST_NAME_REPLY_EXISTS) {
-+                        g_set_error (error,
-+                                     GS_LISTENER_ERROR,
-+                                     GS_LISTENER_ERROR_ACQUISITION_FAILURE,
-+                                     "%s",
-+                                     _("screensaver already running in this session"));
-+                        return FALSE;
-+                }
- 
--        res = dbus_bus_request_name (listener->priv->connection,
--                                     GS_SERVICE_GNOME,
--                                     DBUS_NAME_FLAG_DO_NOT_QUEUE,
--                                     &buserror);
--        if (dbus_error_is_set (&buserror)) {
--                g_set_error (error,
--                             GS_LISTENER_ERROR,
--                             GS_LISTENER_ERROR_ACQUISITION_FAILURE,
--                             "%s",
--                             buserror.message);
--        }
--        if (res == DBUS_REQUEST_NAME_REPLY_EXISTS) {
--                g_set_error (error,
--                             GS_LISTENER_ERROR,
--                             GS_LISTENER_ERROR_ACQUISITION_FAILURE,
--                             "%s",
--                             _("GNOME screensaver already running in this session"));
--                return FALSE;
--        }
-+                dbus_error_free (&buserror);
-+
-+                res = dbus_bus_request_name (listener->priv->connection,
-+                                             GS_SERVICE_GNOME,
-+                                             DBUS_NAME_FLAG_DO_NOT_QUEUE,
-+                                             &buserror);
-+                if (dbus_error_is_set (&buserror)) {
-+                        g_set_error (error,
-+                                     GS_LISTENER_ERROR,
-+                                     GS_LISTENER_ERROR_ACQUISITION_FAILURE,
-+                                     "%s",
-+                                     buserror.message);
-+                }
-+                if (res == DBUS_REQUEST_NAME_REPLY_EXISTS) {
-+                        g_set_error (error,
-+                                     GS_LISTENER_ERROR,
-+                                     GS_LISTENER_ERROR_ACQUISITION_FAILURE,
-+                                     "%s",
-+                                     _("GNOME screensaver already running in this session"));
-+                        return FALSE;
-+                }
- 
--        dbus_error_free (&buserror);
-+                dbus_error_free (&buserror);
++                goto names_acquired;
 +        }
++
+         res = dbus_bus_request_name (listener->priv->connection,
+                                      GS_SERVICE,
+                                      DBUS_NAME_FLAG_DO_NOT_QUEUE,
+@@ -2051,6 +2096,7 @@ gs_listener_acquire (GSListener *listener,
  
+         dbus_error_free (&buserror);
+ 
++names_acquired:
          dbus_connection_add_filter (listener->priv->connection, listener_dbus_filter_function, listener, NULL);
  
+         dbus_bus_add_match (listener->priv->connection,
 diff --git a/src/gs-lock-after.c b/src/gs-lock-after.c
 index 511736c..c3f93a5 100644
 --- a/src/gs-lock-after.c

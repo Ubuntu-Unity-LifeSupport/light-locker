@@ -5,8 +5,15 @@ light-locker (1.8.0-3ubuntu4+unity5) resolute; urgency=medium
     Unity asks for the blank on idle and decides whether and when to lock
     from the desktop's screensaver settings. The setting is not changed.
   * d/p/0009: test of the above in make check.
+  * d/p/0010: in a Unity session org.gnome.ScreenSaver alone decides whether
+    light-locker runs: it is requested first, and org.freedesktop.ScreenSaver
+    is then taken if free (unity-settings-daemon's screensaver proxy may hold
+    it and forwards its calls to org.gnome.ScreenSaver). light-locker used to
+    stop at start when the proxy had that name first. Other desktops
+    unchanged.
+  * d/p/0011: tests of the above in make check (private session bus).
 
- -- NeiroNext <mihail.rozshko@gmail.com>  Tue, 13 Oct 2026 21:12:51 +0000
+ -- NeiroNext <mihail.rozshko@gmail.com>  Sat, 17 Oct 2026 06:02:21 +0000
 
 light-locker (1.8.0-3ubuntu4+unity4) resolute; urgency=medium
 
